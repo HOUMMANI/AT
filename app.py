@@ -11,6 +11,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
+import time
 matplotlib.use("Agg")
 
 # ─── Config page ─────────────────────────────────────────────────────────────
@@ -86,19 +87,48 @@ with st.sidebar:
     st.caption("Données: Yahoo Finance (BVC ~15 min delay)")
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_data(symbol, per):
-    from src.data import BVCDataFetcher
-    fetcher = BVCDataFetcher()
-    return fetcher.get_ohlcv(symbol, period=per)
+    """Fetch OHLCV with retry + exponential backoff for Yahoo rate limits."""
+    import yfinance as yf
+    yahoo_sym = BVC_TICKERS.get(symbol, {}).get("yahoo", symbol + ".CS")
+    delays = [3, 8, 20]
+    for attempt, delay in enumerate(delays + [None]):
+        try:
+            ticker = yf.Ticker(yahoo_sym)
+            df = ticker.history(period=per, auto_adjust=True)
+            if df is not None and not df.empty:
+                df.index = pd.to_datetime(df.index)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                return df
+        except Exception as e:
+            err = str(e).lower()
+            if "ratelimit" in err or "429" in err or "too many" in err:
+                if delay is not None:
+                    time.sleep(delay)
+                    continue
+            # Non rate-limit error — return None immediately
+            return None
+    return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime(symbol):
     try:
-        from src.data.realtime import RealTimeFetcher
-        rt = RealTimeFetcher()
-        return rt.get_quote(symbol)
+        import yfinance as yf
+        yahoo_sym = BVC_TICKERS.get(symbol, {}).get("yahoo", symbol + ".CS")
+        ticker = yf.Ticker(yahoo_sym)
+        info = ticker.fast_info
+        return {
+            "price": getattr(info, "last_price", None),
+            "open": getattr(info, "open", None),
+            "high": getattr(info, "day_high", None),
+            "low": getattr(info, "day_low", None),
+            "volume": getattr(info, "last_volume", None),
+            "high_52w": getattr(info, "year_high", None),
+            "low_52w": getattr(info, "year_low", None),
+        }
     except Exception:
         return None
 
@@ -126,7 +156,7 @@ if page == "🔍 Analyse":
         qt = fetch_realtime(selected_symbol)
 
     if df is None or df.empty:
-        st.error("Aucune donnée disponible pour ce symbole.")
+        st.warning("⏳ Yahoo Finance limite les requêtes depuis les serveurs cloud. Réessaie dans quelques secondes.")
         st.stop()
 
     # ── KPIs ──────────────────────────────────────────────────────────────────
@@ -139,11 +169,11 @@ if page == "🔍 Analyse":
               delta=f"{var_1j:+.2f}%",
               delta_color="normal")
 
-    if qt:
-        c2.metric("Ouverture", f"{qt.open_:.2f}")
-        c3.metric("Haut", f"{qt.high:.2f}")
-        c4.metric("Bas", f"{qt.low:.2f}")
-        c5.metric("Volume", f"{int(qt.volume):,}" if qt.volume else "—")
+    if qt and qt.get("open"):
+        c2.metric("Ouverture", f"{qt['open']:.2f}")
+        c3.metric("Haut", f"{qt['high']:.2f}")
+        c4.metric("Bas", f"{qt['low']:.2f}")
+        c5.metric("Volume", f"{int(qt['volume']):,}" if qt.get("volume") else "—")
     else:
         c2.metric("Haut 52s", f"{df['High'].tail(252).max():.2f}")
         c3.metric("Bas 52s", f"{df['Low'].tail(252).min():.2f}")
@@ -345,17 +375,30 @@ elif page == "🏪 Marché":
             ["Tous"] + sorted(SECTORS),
         )
 
-    @st.cache_data(ttl=600, show_spinner=False)
+    @st.cache_data(ttl=1800, show_spinner=False)
     def fetch_market(per):
-        from src.data import BVCDataFetcher
-        fetcher = BVCDataFetcher()
-        return fetcher.get_market_overview(period=per)
+        rows = []
+        for sym, info in list(BVC_TICKERS.items())[:25]:
+            df_s = fetch_data(sym, per)
+            if df_s is not None and not df_s.empty:
+                last = df_s["Close"].iloc[-1]
+                prev = df_s["Close"].iloc[-2] if len(df_s) > 1 else last
+                rows.append({
+                    "Symbole": sym,
+                    "Nom": info.get("name", sym)[:28],
+                    "Secteur": info.get("secteur", "—"),
+                    "Dernier cours": last,
+                    "Variation (%)": (last - prev) / prev * 100,
+                })
+            time.sleep(0.3)  # polite delay to avoid rate limit
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    with st.spinner("Récupération des données marché..."):
+    with st.spinner("Récupération des données marché (peut prendre ~30s)..."):
         overview = fetch_market(market_period)
 
-    if overview.empty:
-        st.error("Impossible de récupérer les données du marché.")
+    if overview is None or overview.empty:
+        st.warning("⏳ Données indisponibles — Yahoo Finance limite les requêtes. Réessaie dans 1 minute.")
+        st.stop()
     else:
         # Filtre secteur
         if sector_filter != "Tous":
