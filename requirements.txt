@@ -1,0 +1,17 @@
+# Données financières
+yfinance>=0.2.36
+
+# Traitement des données
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualisation
+matplotlib>=3.7.0
+plotly>=5.18.0
+
+# Optionnel - pour les heatmaps
+seaborn>=0.13.0
+
+# Optionnel - pour les notebooks
+jupyter>=1.0.0
+ipykernel>=6.0.0
