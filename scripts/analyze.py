@@ -58,12 +58,17 @@ def cmd_analyze(args):
             if args.save:
                 save_path = f"{args.symbole}_{args.period}.png"
 
+            no_patterns = getattr(args, "no_patterns", False)
+
             fig = plot_chart(
                 analyzer.compute_all(),
                 show_volume=True,
                 show_bollinger=True,
                 show_macd=True,
                 show_rsi=True,
+                show_patterns=not no_patterns,
+                show_trendlines=not no_patterns,
+                show_fibonacci=not no_patterns,
                 save_path=save_path,
             )
 
@@ -224,6 +229,8 @@ Exemples:
                         help="Lister toutes les actions disponibles")
     parser.add_argument("--comparer", metavar="S1,S2,...",
                         help="Comparer plusieurs symboles (séparés par virgules)")
+    parser.add_argument("--no-patterns", action="store_true",
+                        help="Désactiver l'affichage des patterns sur le graphique")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Mode verbeux")
 
