@@ -278,6 +278,71 @@ def cmd_compare(args):
     print("=" * 80)
 
 
+def cmd_dashboard(args):
+    """Lance le dashboard complet 8 panneaux."""
+    from src.visualization.dashboard import plot_dashboard, AVAILABLE_OVERLAYS
+    import matplotlib.pyplot as plt
+
+    fetcher = BVCDataFetcher()
+    symbol = args.symbole
+
+    # Overlays sélectionnés
+    if args.overlays:
+        overlays = [o.strip() for o in args.overlays.split(",")]
+        unknown = [o for o in overlays if o not in AVAILABLE_OVERLAYS]
+        if unknown:
+            print(f"Overlays inconnus: {unknown}")
+            print(f"Disponibles: {list(AVAILABLE_OVERLAYS.keys())}")
+            return
+    else:
+        overlays = None  # tous
+
+    print(f"\nPréparation du dashboard 8 panneaux pour {symbol}...")
+
+    # Données journalières (base)
+    try:
+        df = fetcher.get_ohlcv(symbol, period=args.period)
+    except Exception as e:
+        print(f"Erreur données: {e}")
+        return
+    if df.empty:
+        print("Aucune donnée disponible.")
+        return
+
+    # MTF optionnel (pour le panel 3)
+    mtf = None
+    if not getattr(args, "no_patterns", False):
+        try:
+            print("  Chargement multi-timeframes...")
+            mtf = MultiTimeframeAnalyzer(symbol, fetcher=fetcher)
+            mtf.run()
+        except Exception:
+            mtf = None
+
+    # Analyzer
+    from src.analysis import TechnicalAnalyzer
+    analyzer = TechnicalAnalyzer(df)
+
+    save_path = f"{symbol}_dashboard.png" if args.save else None
+
+    print("  Génération du dashboard...")
+    fig = plot_dashboard(
+        df,
+        overlays=overlays,
+        mtf_analyzer=mtf,
+        analyzer=analyzer,
+        save_path=save_path,
+        title=f"{symbol} — Dashboard Analyse Technique BVC",
+    )
+
+    if args.chart and not args.save:
+        plt.show()
+    elif save_path:
+        print(f"Dashboard sauvegardé: {save_path}")
+
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyse technique des actions de la Bourse de Casablanca (BVC)",
@@ -318,6 +383,16 @@ Exemples:
     parser.add_argument("--timeframe", "-t",
                         metavar="TF",
                         help="Timeframe spécifique: journalier|hebdomadaire|mensuel (ou 1d|1wk|1mo)")
+    parser.add_argument("--dashboard", "-d", action="store_true",
+                        help="Afficher le dashboard complet 8 panneaux")
+    parser.add_argument("--overlays",
+                        metavar="O1,O2,...",
+                        help=(
+                            "Tracés à afficher dans le panel 2, séparés par virgules.\n"
+                            "Disponibles: fibonacci, trendlines, ichimoku, pivots, "
+                            "patterns, support_resistance, regression, candlestick_patterns\n"
+                            "(défaut: tous)"
+                        ))
     parser.add_argument("--no-patterns", action="store_true",
                         help="Désactiver l'affichage des patterns sur le graphique")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -335,6 +410,8 @@ Exemples:
     elif args.comparer:
         args.symboles = args.comparer
         cmd_compare(args)
+    elif args.symbole and args.dashboard:
+        cmd_dashboard(args)
     elif args.symbole and args.mtf:
         cmd_mtf(args)
     elif args.symbole and args.timeframe:
@@ -345,6 +422,8 @@ Exemples:
         parser.print_help()
         print("\nExemples rapides:")
         print("  python scripts/analyze.py ATW --chart")
+        print("  python scripts/analyze.py ATW --dashboard --save")
+        print("  python scripts/analyze.py ATW --dashboard --overlays fibonacci,ichimoku,trendlines")
         print("  python scripts/analyze.py ATW --mtf --chart")
         print("  python scripts/analyze.py ATW --timeframe hebdomadaire --chart")
 
