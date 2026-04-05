@@ -1,4 +1,5 @@
-"AT — Analyse Technique BVC"
+"""
+AT — Analyse Technique BVC
 Application Streamlit pour l'analyse des actions de la Bourse de Casablanca.
 """
 
@@ -64,7 +65,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Symbole commun
     symbol_list = sorted(BVC_TICKERS.keys())
     symbol_names = {s: f"{s} — {BVC_TICKERS[s]['name']}" for s in symbol_list}
 
