@@ -8,7 +8,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
-from matplotlib.patches import Rectangle
+import matplotlib.patches as mpatches
+from matplotlib.patches import Rectangle, FancyArrowPatch
 from typing import Optional, List
 import warnings
 warnings.filterwarnings("ignore")
@@ -55,6 +56,233 @@ def _apply_dark_theme(fig, axes):
         ax.grid(True, color=c["grid"], linewidth=0.5, alpha=0.7)
 
 
+def plot_patterns(
+    ax,
+    df: pd.DataFrame,
+    show_candlestick_patterns: bool = True,
+    show_chart_patterns: bool = True,
+    show_trendlines: bool = True,
+    show_fibonacci: bool = True,
+    dark_theme: bool = True,
+):
+    """
+    Superpose les patterns et configurations graphiques sur un axe matplotlib.
+
+    Args:
+        ax: Axe matplotlib (graphique principal)
+        df: DataFrame OHLCV
+        show_candlestick_patterns: Afficher les marqueurs de patterns bougies
+        show_chart_patterns: Afficher les zones de configurations graphiques
+        show_trendlines: Afficher les lignes de tendance
+        show_fibonacci: Afficher les niveaux Fibonacci
+        dark_theme: Thème sombre
+    """
+    c = DARK_THEME if dark_theme else {}
+    up_color = c.get("up", "#26a641")
+    down_color = c.get("down", "#da3633")
+    text_color = c.get("text", "#c9d1d9")
+    grid_color = c.get("grid", "#21262d")
+
+    # --- Patterns de bougies japonaises ---
+    if show_candlestick_patterns:
+        try:
+            from ..patterns.candlesticks import CandlestickPatterns
+            cp = CandlestickPatterns(df)
+            recent = cp.get_recent(lookback=20)
+
+            bullish_markers = []
+            bearish_markers = []
+
+            for p in recent:
+                date = p["date"]
+                if date not in df.index:
+                    continue
+                price = df.loc[date, "Low"] if p["direction"] == "HAUSSIER" else df.loc[date, "High"]
+                if p["direction"] == "HAUSSIER":
+                    bullish_markers.append((date, price))
+                elif p["direction"] == "BAISSIER":
+                    bearish_markers.append((date, price))
+
+            # Triangles haussiers (pointe vers le haut) sous les bougies
+            if bullish_markers:
+                dates, prices = zip(*bullish_markers)
+                offset = df["High"].mean() * 0.015
+                ax.scatter(dates, [p - offset for p in prices],
+                           marker="^", color=up_color, s=80, zorder=5, alpha=0.9,
+                           label="Pattern haussier")
+
+            # Triangles baissiers (pointe vers le bas) au-dessus des bougies
+            if bearish_markers:
+                dates, prices = zip(*bearish_markers)
+                offset = df["High"].mean() * 0.015
+                ax.scatter(dates, [p + offset for p in prices],
+                           marker="v", color=down_color, s=80, zorder=5, alpha=0.9,
+                           label="Pattern baissier")
+
+            # Annotations pour les patterns les plus récents (max 3)
+            shown = 0
+            for p in recent[:5]:
+                if shown >= 3:
+                    break
+                date = p["date"]
+                if date not in df.index:
+                    continue
+                name = p["pattern"]
+                if len(name) > 16:
+                    name = name[:14] + ".."
+                price = df.loc[date, "Close"]
+                offset = df["High"].mean() * 0.03
+                y = price - offset if p["direction"] == "HAUSSIER" else price + offset
+                va = "top" if p["direction"] == "HAUSSIER" else "bottom"
+                ax.annotate(
+                    name,
+                    xy=(date, price),
+                    xytext=(date, y),
+                    fontsize=7,
+                    color=up_color if p["direction"] == "HAUSSIER" else down_color,
+                    ha="center", va=va,
+                    bbox=dict(boxstyle="round,pad=0.2",
+                              fc=c.get("ax_bg", "#161b22"), alpha=0.7, ec="none"),
+                )
+                shown += 1
+        except Exception:
+            pass
+
+    # --- Lignes de tendance ---
+    if show_trendlines:
+        try:
+            from ..patterns.trendlines import TrendlineDetector
+            td = TrendlineDetector(df)
+            lines = td.detect_all()
+
+            tl_colors = {
+                ("HAUSSIERE", "SUPPORT"): up_color,
+                ("BAISSIERE", "RESISTANCE"): down_color,
+                ("HORIZONTALE", "SUPPORT"): "#58a6ff",
+                ("HORIZONTALE", "RESISTANCE"): "#f0b429",
+            }
+
+            x_all = np.arange(len(df))
+            plotted = 0
+            for tl in lines[:6]:
+                if tl.force in ("Faible",) and plotted >= 3:
+                    continue
+                color = tl_colors.get((tl.type, tl.direction), "#888888")
+                linestyle = "--" if tl.type == "HORIZONTALE" else "-"
+                alpha = 0.8 if tl.force in ("Forte", "Très forte") else 0.5
+
+                if tl.type == "HORIZONTALE":
+                    ax.axhline(
+                        y=tl.prix_actuel,
+                        color=color, linewidth=1.0,
+                        linestyle=linestyle, alpha=alpha,
+                        label=f"S/R {tl.prix_actuel:.2f}"
+                    )
+                    ax.annotate(
+                        f"{tl.direction[0]}{tl.prix_actuel:.1f}",
+                        xy=(df.index[-1], tl.prix_actuel),
+                        fontsize=7, color=color, alpha=0.9,
+                        ha="right", va="center",
+                    )
+                else:
+                    # Calculer les points de la ligne sur toute la période
+                    if tl.date_debut in df.index and tl.date_fin in df.index:
+                        i_start = df.index.get_loc(tl.date_debut)
+                        i_end = len(df) - 1
+                        slope = tl.pente
+                        intercept = tl.prix_debut - slope * i_start
+                        y_vals = slope * x_all[i_start:] + intercept
+                        ax.plot(
+                            df.index[i_start:], y_vals,
+                            color=color, linewidth=1.2,
+                            linestyle=linestyle, alpha=alpha,
+                        )
+                plotted += 1
+        except Exception:
+            pass
+
+    # --- Niveaux Fibonacci ---
+    if show_fibonacci:
+        try:
+            from ..patterns.fibonacci import FibonacciAnalyzer
+            fib = FibonacciAnalyzer(df)
+            analysis = fib.analyze()
+
+            fib_colors = {
+                0.0: "#888888",
+                0.236: "#58a6ff",
+                0.382: "#f0b429",
+                0.500: "#ffffff",
+                0.618: "#f0b429",
+                0.786: "#58a6ff",
+                1.0: "#888888",
+            }
+
+            current = df["Close"].iloc[-1]
+            # Afficher seulement les niveaux proches du prix (±20%)
+            for lvl in analysis.niveaux:
+                if abs(lvl.distance_pct) > 20:
+                    continue
+                if lvl.type != "retracement":
+                    continue
+                color = fib_colors.get(lvl.ratio, "#aaaaaa")
+                linestyle = ":" if lvl.ratio not in (0.382, 0.500, 0.618) else "-."
+                ax.axhline(
+                    y=lvl.prix,
+                    color=color, linewidth=0.8,
+                    linestyle=linestyle, alpha=0.6,
+                )
+                ax.annotate(
+                    f"Fib {lvl.ratio*100:.1f}%  {lvl.prix:.1f}",
+                    xy=(df.index[len(df)//4], lvl.prix),
+                    fontsize=6.5, color=color, alpha=0.8,
+                    ha="left", va="bottom",
+                )
+        except Exception:
+            pass
+
+    # --- Configurations graphiques ---
+    if show_chart_patterns:
+        try:
+            from ..patterns.chart_patterns import ChartPatternDetector
+            detector = ChartPatternDetector(df)
+            patterns = detector.detect_all()
+
+            for p in patterns[:3]:
+                color = up_color if p.direction == "HAUSSIER" else down_color if p.direction == "BAISSIER" else "#aaaaaa"
+
+                # Ligne de breakout
+                ax.axhline(
+                    y=p.niveau_breakout,
+                    color=color, linewidth=1.5,
+                    linestyle="-.", alpha=0.85,
+                )
+                ax.annotate(
+                    f"▶ {p.nom}  Breakout: {p.niveau_breakout}",
+                    xy=(df.index[-len(df)//5], p.niveau_breakout),
+                    fontsize=7.5, color=color, fontweight="bold",
+                    ha="left", va="bottom",
+                    bbox=dict(boxstyle="round,pad=0.3",
+                              fc=c.get("ax_bg", "#161b22"), alpha=0.8, ec=color, lw=0.8),
+                )
+
+                # Objectif de prix
+                if p.objectif_prix:
+                    ax.axhline(
+                        y=p.objectif_prix,
+                        color=color, linewidth=0.8,
+                        linestyle=":", alpha=0.5,
+                    )
+                    ax.annotate(
+                        f"  Obj: {p.objectif_prix}",
+                        xy=(df.index[-len(df)//5], p.objectif_prix),
+                        fontsize=7, color=color, alpha=0.7,
+                        ha="left", va="bottom",
+                    )
+        except Exception:
+            pass
+
+
 def plot_chart(
     df: pd.DataFrame,
     title: Optional[str] = None,
@@ -63,12 +291,15 @@ def plot_chart(
     show_bollinger: bool = True,
     show_macd: bool = True,
     show_rsi: bool = True,
+    show_patterns: bool = True,
+    show_trendlines: bool = True,
+    show_fibonacci: bool = True,
     figsize: tuple = (16, 12),
     save_path: Optional[str] = None,
     dark_theme: bool = True,
 ) -> plt.Figure:
     """
-    Crée un graphique complet avec chandeliers japonais et indicateurs.
+    Crée un graphique complet avec chandeliers japonais, indicateurs et patterns.
 
     Args:
         df: DataFrame OHLCV (avec indicateurs calculés si disponibles)
@@ -77,6 +308,9 @@ def plot_chart(
         show_bollinger: Afficher les bandes de Bollinger
         show_macd: Afficher le panneau MACD
         show_rsi: Afficher le panneau RSI
+        show_patterns: Afficher les patterns de bougies et configurations graphiques
+        show_trendlines: Afficher les lignes de tendance
+        show_fibonacci: Afficher les niveaux Fibonacci
         figsize: Taille de la figure
         save_path: Chemin pour sauvegarder (optionnel)
         dark_theme: Utiliser le thème sombre
@@ -205,6 +439,27 @@ def plot_chart(
                       labelcolor=c["text"], fontsize=7)
         ax_rsi.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
         plt.setp(ax_rsi.get_xticklabels(), rotation=30, ha="right")
+
+    # --- Patterns, lignes de tendance et Fibonacci sur le graphique principal ---
+    if show_patterns or show_trendlines or show_fibonacci:
+        plot_patterns(
+            ax_main, df,
+            show_candlestick_patterns=show_patterns,
+            show_chart_patterns=show_patterns,
+            show_trendlines=show_trendlines,
+            show_fibonacci=show_fibonacci,
+            dark_theme=dark_theme,
+        )
+
+    # Mise à jour de la légende après ajout des patterns
+    handles, labels = ax_main.get_legend_handles_labels()
+    if handles:
+        ax_main.legend(
+            handles[:8], labels[:8],  # limiter à 8 éléments
+            loc="upper left",
+            facecolor=c["ax_bg"], edgecolor=c["grid"],
+            labelcolor=c["text"], fontsize=7,
+        )
 
     plt.tight_layout()
 

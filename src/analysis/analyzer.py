@@ -11,6 +11,10 @@ from ..indicators.trend import sma, ema, macd
 from ..indicators.momentum import rsi, stochastic, cci, williams_r
 from ..indicators.volatility import bollinger_bands, atr, historical_volatility
 from ..indicators.volume import obv, volume_sma, mfi, cmf, relative_volume
+from ..patterns.candlesticks import CandlestickPatterns
+from ..patterns.chart_patterns import ChartPatternDetector
+from ..patterns.fibonacci import FibonacciAnalyzer
+from ..patterns.trendlines import TrendlineDetector
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +334,44 @@ class TechnicalAnalyzer:
             "nb_periodes": len(df),
         }
 
-    def full_report(self) -> str:
+    # =========================================================
+    # PATTERNS
+    # =========================================================
+
+    def detect_candlestick_patterns(self, lookback: int = 15) -> list:
+        """Détecte les patterns de bougies japonaises récents."""
+        cp = CandlestickPatterns(self.df)
+        return cp.get_recent(lookback)
+
+    def detect_chart_patterns(self) -> list:
+        """Détecte les configurations graphiques (H&S, triangles, etc.)."""
+        try:
+            detector = ChartPatternDetector(self.df)
+            return detector.detect_all()
+        except Exception as e:
+            logger.warning(f"Détection chart patterns impossible: {e}")
+            return []
+
+    def fibonacci_analysis(self) -> object:
+        """Retourne l'analyse Fibonacci complète."""
+        fib = FibonacciAnalyzer(self.df)
+        return fib.analyze()
+
+    def trendline_analysis(self) -> list:
+        """Détecte les lignes de tendance actives."""
+        try:
+            td = TrendlineDetector(self.df)
+            return td.detect_all()
+        except Exception as e:
+            logger.warning(f"Détection trendlines impossible: {e}")
+            return []
+
+    def full_report(self, include_patterns: bool = True) -> str:
         """
         Génère un rapport d'analyse technique complet en texte.
+
+        Args:
+            include_patterns: Inclure la détection de patterns (défaut: True)
         """
         self.compute_all()
         summ = self.summary()
@@ -341,9 +380,9 @@ class TechnicalAnalyzer:
         sr = self.support_resistance()
 
         lines = [
-            "=" * 60,
+            "=" * 65,
             f"  ANALYSE TECHNIQUE - {summ['symbole']} | {summ['nom']}",
-            "=" * 60,
+            "=" * 65,
             "",
             "[ COURS ]",
             f"  Dernier cours    : {summ['dernier_cours']} MAD",
@@ -378,13 +417,42 @@ class TechnicalAnalyzer:
             note = sig.get("note", "")
             lines.append(f"  {name:<18}: {signal_str:<12} | {note}")
 
+        if include_patterns:
+            # --- Patterns bougies ---
+            try:
+                cp = CandlestickPatterns(self.df)
+                lines.append(cp.report(lookback=15))
+            except Exception:
+                pass
+
+            # --- Lignes de tendance ---
+            try:
+                td = TrendlineDetector(self.df)
+                lines.append(td.report())
+            except Exception:
+                pass
+
+            # --- Fibonacci ---
+            try:
+                fib = FibonacciAnalyzer(self.df)
+                lines.append(fib.report())
+            except Exception:
+                pass
+
+            # --- Configurations graphiques ---
+            try:
+                detector = ChartPatternDetector(self.df)
+                lines.append(detector.report())
+            except Exception:
+                pass
+
         lines += [
             "",
             "[ SCORE GLOBAL ]",
             f"  Score            : {score_data['score']:+.1f} / 100",
             f"  Recommandation   : {score_data['recommandation']}",
             "",
-            "=" * 60,
+            "=" * 65,
         ]
 
         return "\n".join(lines)
