@@ -343,6 +343,59 @@ def cmd_dashboard(args):
     plt.close(fig)
 
 
+def cmd_live(args):
+    """Lance le dashboard live en temps réel."""
+    symbol = args.symbole
+    refresh = getattr(args, "refresh", 60)
+    interval = getattr(args, "interval", "5m")
+
+    try:
+        from src.visualization.live_dashboard import LiveDashboard
+    except ImportError as e:
+        print(f"Impossible de lancer le dashboard live: {e}")
+        return
+
+    print(f"\nDémarrage du dashboard temps réel pour {symbol}...")
+    print(f"  Rafraîchissement: {refresh}s  |  Intervalle intraday: {interval}")
+    print("  Fermez la fenêtre pour arrêter.\n")
+
+    dash = LiveDashboard(symbol, refresh=refresh, interval=interval)
+
+    if args.save:
+        snap = f"{symbol}_live_snapshot.png"
+        dash.save_snapshot(snap)
+        print(f"Snapshot sauvegardé: {snap}")
+    else:
+        dash.run()
+
+
+def cmd_ticker(args):
+    """Lance le ticker Bloomberg-style dans le terminal."""
+    if args.symboles:
+        symbols = [s.strip().upper() for s in args.symboles.split(",")]
+    else:
+        # Top 10 valeurs par défaut
+        from src.data.tickers import BVC_TICKERS
+        symbols = list(BVC_TICKERS.keys())[:15]
+
+    refresh = getattr(args, "refresh", 30)
+
+    try:
+        from src.visualization.live_dashboard import LiveTicker
+    except ImportError as e:
+        print(f"Impossible de lancer le ticker: {e}")
+        return
+
+    print(f"\nDémarrage du ticker BVC ({len(symbols)} valeurs, rafraîchissement: {refresh}s)")
+    print("  Ctrl+C pour arrêter.\n")
+
+    ticker = LiveTicker(symbols, refresh=refresh)
+    try:
+        ticker.run()
+    except KeyboardInterrupt:
+        print("\nTicker arrêté.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyse technique des actions de la Bourse de Casablanca (BVC)",
@@ -395,6 +448,16 @@ Exemples:
                         ))
     parser.add_argument("--no-patterns", action="store_true",
                         help="Désactiver l'affichage des patterns sur le graphique")
+    parser.add_argument("--live", action="store_true",
+                        help="Dashboard temps réel avec mise à jour automatique")
+    parser.add_argument("--ticker", action="store_true",
+                        help="Ticker Bloomberg-style dans le terminal")
+    parser.add_argument("--refresh", type=int, default=60,
+                        metavar="SEC",
+                        help="Intervalle de rafraîchissement en secondes pour --live/--ticker (défaut: 60)")
+    parser.add_argument("--interval", default="5m",
+                        choices=["1m", "2m", "5m", "15m", "30m", "60m", "90m"],
+                        help="Intervalle intraday pour --live (défaut: 5m)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Mode verbeux")
 
@@ -405,11 +468,16 @@ Exemples:
         cmd_liste(args)
     elif args.marche:
         cmd_marche(args)
+    elif args.ticker:
+        args.symboles = args.comparer if args.comparer else (args.symbole or "")
+        cmd_ticker(args)
     elif args.secteur and not args.symbole:
         cmd_secteur(args)
     elif args.comparer:
         args.symboles = args.comparer
         cmd_compare(args)
+    elif args.symbole and args.live:
+        cmd_live(args)
     elif args.symbole and args.dashboard:
         cmd_dashboard(args)
     elif args.symbole and args.mtf:
@@ -422,6 +490,10 @@ Exemples:
         parser.print_help()
         print("\nExemples rapides:")
         print("  python scripts/analyze.py ATW --chart")
+        print("  python scripts/analyze.py ATW --live")
+        print("  python scripts/analyze.py ATW --live --refresh 30 --interval 1m")
+        print("  python scripts/analyze.py --ticker")
+        print("  python scripts/analyze.py --ticker --comparer ATW,IAM,BCP")
         print("  python scripts/analyze.py ATW --dashboard --save")
         print("  python scripts/analyze.py ATW --dashboard --overlays fibonacci,ichimoku,trendlines")
         print("  python scripts/analyze.py ATW --mtf --chart")

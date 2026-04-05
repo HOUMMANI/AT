@@ -16,3 +16,8 @@ seaborn>=0.13.0
 # Optionnel - pour les notebooks
 jupyter>=1.0.0
 ipykernel>=6.0.0
+
+# Données temps réel
+pytz>=2023.3
+requests>=2.31.0
+beautifulsoup4>=4.12.0
