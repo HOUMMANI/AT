@@ -1,6 +1,8 @@
 """
 Module de récupération des données de marché pour la BVC.
-Utilise Yahoo Finance comme source principale de données.
+Sources (par ordre de priorité) :
+  1. Stooq      — via pandas_datareader, gratuit, pas de rate-limit
+  2. Yahoo Finance — fallback via yfinance
 """
 
 import pandas as pd
@@ -8,10 +10,77 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Optional, Union
 import logging
+import time
 
 from .tickers import BVC_TICKERS, get_ticker_info
 
 logger = logging.getLogger(__name__)
+
+
+def _period_to_start(period: str) -> datetime:
+    """Convertit une période (ex: '1y') en date de début."""
+    now = datetime.now()
+    mapping = {
+        "1d": timedelta(days=1), "5d": timedelta(days=5),
+        "1mo": timedelta(days=31), "3mo": timedelta(days=92),
+        "6mo": timedelta(days=183), "1y": timedelta(days=365),
+        "2y": timedelta(days=730), "5y": timedelta(days=1825),
+        "10y": timedelta(days=3650), "ytd": timedelta(days=(now - datetime(now.year, 1, 1)).days),
+        "max": timedelta(days=7300),
+    }
+    return now - mapping.get(period, timedelta(days=365))
+
+
+def _fetch_stooq(yahoo_ticker: str, period: str = "1y",
+                 start: Optional[str] = None, end: Optional[str] = None,
+                 interval: str = "1d") -> pd.DataFrame:
+    """
+    Récupère les données depuis Stooq via pandas_datareader.
+    Stooq utilise le même suffixe .CS que Yahoo pour les actions marocaines.
+    Supporte uniquement interval=1d/1wk/1mo (pas d'intraday).
+    """
+    if interval not in ("1d", "1wk", "1mo"):
+        return pd.DataFrame()
+
+    try:
+        from pandas_datareader import data as pdr
+
+        # Stooq: le symbole doit être en minuscules
+        stooq_sym = yahoo_ticker.lower()
+
+        dt_start = datetime.strptime(start, "%Y-%m-%d") if start else _period_to_start(period)
+        dt_end = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+
+        df = pdr.DataReader(stooq_sym, "stooq", start=dt_start, end=dt_end)
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.sort_index()
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # Stooq renvoie Open/High/Low/Close/Volume
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+        # Rééchantillonner si hebdo ou mensuel
+        if interval == "1wk":
+            df = df.resample("W").agg({
+                "Open": "first", "High": "max", "Low": "min",
+                "Close": "last", "Volume": "sum"
+            }).dropna()
+        elif interval == "1mo":
+            df = df.resample("ME").agg({
+                "Open": "first", "High": "max", "Low": "min",
+                "Close": "last", "Volume": "sum"
+            }).dropna()
+
+        return df
+
+    except Exception as e:
+        logger.debug(f"Stooq échec pour {yahoo_ticker}: {e}")
+        return pd.DataFrame()
 
 
 class BVCDataFetcher:
@@ -74,36 +143,54 @@ class BVCDataFetcher:
         if cache_key in self._cache:
             return self._cache[cache_key].copy()
 
-        try:
-            ticker = yf.Ticker(yahoo_ticker)
-            if start:
-                df = ticker.history(start=start, end=end, interval=interval)
-            else:
-                df = ticker.history(period=period, interval=interval)
+        # ── 1. Essayer Stooq (pas de rate-limit, fiable sur serveurs cloud) ──────
+        df = _fetch_stooq(yahoo_ticker, period=period, start=start, end=end, interval=interval)
 
-            if df.empty:
-                logger.warning(f"Aucune donnée trouvée pour {symbol} ({yahoo_ticker})")
-                return pd.DataFrame()
+        # ── 2. Fallback Yahoo Finance avec retry ─────────────────────────────
+        if df.empty:
+            delays = [2, 6, 15]
+            for delay in delays + [None]:
+                try:
+                    ticker = yf.Ticker(yahoo_ticker)
+                    if start:
+                        df = ticker.history(start=start, end=end, interval=interval)
+                    else:
+                        df = ticker.history(period=period, interval=interval)
+                    if not df.empty:
+                        break
+                except Exception as e:
+                    err = str(e).lower()
+                    if ("ratelimit" in err or "429" in err or "too many" in err) and delay:
+                        logger.warning(f"Yahoo rate-limit pour {symbol}, retry dans {delay}s")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"Yahoo erreur pour {symbol}: {e}")
+                        break
 
-            # Nettoyer et standardiser
-            df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            df.index = pd.to_datetime(df.index)
-            df.index.name = "Date"
-            df = df.sort_index()
-            df.attrs["symbol"] = symbol
-            df.attrs["yahoo_ticker"] = yahoo_ticker
+        if df is None or df.empty:
+            logger.warning(f"Aucune donnée disponible pour {symbol} ({yahoo_ticker})")
+            return pd.DataFrame()
 
-            info = get_ticker_info(symbol)
-            df.attrs["name"] = info.get("name", symbol) if info else symbol
-            df.attrs["secteur"] = info.get("secteur", "N/A") if info else "N/A"
+        # Nettoyer et standardiser
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col not in df.columns:
+                df[col] = 0
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        df.index = pd.to_datetime(df.index)
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df.index.name = "Date"
+        df = df.sort_index()
+        df.attrs["symbol"] = symbol
+        df.attrs["yahoo_ticker"] = yahoo_ticker
 
-            self._cache[cache_key] = df
-            logger.info(f"Données récupérées: {symbol} ({len(df)} lignes)")
-            return df.copy()
+        info = get_ticker_info(symbol)
+        df.attrs["name"] = info.get("name", symbol) if info else symbol
+        df.attrs["secteur"] = info.get("secteur", "N/A") if info else "N/A"
 
-        except Exception as e:
-            logger.error(f"Erreur lors de la récupération des données de {symbol}: {e}")
-            raise
+        self._cache[cache_key] = df
+        logger.info(f"Données récupérées: {symbol} ({len(df)} lignes)")
+        return df.copy()
 
     def get_multiple(
         self,

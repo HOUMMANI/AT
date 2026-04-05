@@ -89,28 +89,11 @@ with st.sidebar:
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_data(symbol, per):
-    """Fetch OHLCV with retry + exponential backoff for Yahoo rate limits."""
-    import yfinance as yf
-    yahoo_sym = BVC_TICKERS.get(symbol, {}).get("yahoo", symbol + ".CS")
-    delays = [3, 8, 20]
-    for attempt, delay in enumerate(delays + [None]):
-        try:
-            ticker = yf.Ticker(yahoo_sym)
-            df = ticker.history(period=per, auto_adjust=True)
-            if df is not None and not df.empty:
-                df.index = pd.to_datetime(df.index)
-                if df.index.tz is not None:
-                    df.index = df.index.tz_localize(None)
-                return df
-        except Exception as e:
-            err = str(e).lower()
-            if "ratelimit" in err or "429" in err or "too many" in err:
-                if delay is not None:
-                    time.sleep(delay)
-                    continue
-            # Non rate-limit error — return None immediately
-            return None
-    return None
+    """Stooq en priorité, Yahoo Finance en fallback."""
+    from src.data.fetcher import BVCDataFetcher
+    fetcher = BVCDataFetcher()
+    df = fetcher.get_ohlcv(symbol, period=per)
+    return df if (df is not None and not df.empty) else None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -377,23 +360,27 @@ elif page == "🏪 Marché":
 
     @st.cache_data(ttl=1800, show_spinner=False)
     def fetch_market(per):
+        from src.data.fetcher import BVCDataFetcher
+        fetcher = BVCDataFetcher()
         rows = []
-        for sym, info in list(BVC_TICKERS.items())[:25]:
-            df_s = fetch_data(sym, per)
-            if df_s is not None and not df_s.empty:
-                last = df_s["Close"].iloc[-1]
-                prev = df_s["Close"].iloc[-2] if len(df_s) > 1 else last
-                rows.append({
-                    "Symbole": sym,
-                    "Nom": info.get("name", sym)[:28],
-                    "Secteur": info.get("secteur", "—"),
-                    "Dernier cours": last,
-                    "Variation (%)": (last - prev) / prev * 100,
-                })
-            time.sleep(0.3)  # polite delay to avoid rate limit
+        for sym, sym_info in list(BVC_TICKERS.items())[:25]:
+            try:
+                df_s = fetcher.get_ohlcv(sym, period=per)
+                if df_s is not None and not df_s.empty:
+                    last = df_s["Close"].iloc[-1]
+                    prev = df_s["Close"].iloc[-2] if len(df_s) > 1 else last
+                    rows.append({
+                        "Symbole": sym,
+                        "Nom": sym_info.get("name", sym)[:28],
+                        "Secteur": sym_info.get("secteur", "—"),
+                        "Dernier cours": last,
+                        "Variation (%)": (last - prev) / prev * 100,
+                    })
+            except Exception:
+                pass
         return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    with st.spinner("Récupération des données marché (peut prendre ~30s)..."):
+    with st.spinner("Récupération des données marché..."):
         overview = fetch_market(market_period)
 
     if overview is None or overview.empty:
