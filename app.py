@@ -1,5 +1,4 @@
-"""
-AT — Analyse Technique BVC
+"AT — Analyse Technique BVC"
 Application Streamlit pour l'analyse des actions de la Bourse de Casablanca.
 """
 
@@ -11,6 +10,7 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
+import time
 matplotlib.use("Agg")
 
 # ─── Config page ─────────────────────────────────────────────────────────────
@@ -86,19 +86,47 @@ with st.sidebar:
     st.caption("Données: Yahoo Finance (BVC ~15 min delay)")
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_data(symbol, per):
-    from src.data import BVCDataFetcher
-    fetcher = BVCDataFetcher()
-    return fetcher.get_ohlcv(symbol, period=per)
+    """Fetch OHLCV with retry + exponential backoff for Yahoo rate limits."""
+    import yfinance as yf
+    yahoo_sym = BVC_TICKERS.get(symbol, {}).get("yahoo", symbol + ".CS")
+    delays = [3, 8, 20]
+    for attempt, delay in enumerate(delays + [None]):
+        try:
+            ticker = yf.Ticker(yahoo_sym)
+            df = ticker.history(period=per, auto_adjust=True)
+            if df is not None and not df.empty:
+                df.index = pd.to_datetime(df.index)
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                return df
+        except Exception as e:
+            err = str(e).lower()
+            if "ratelimit" in err or "429" in err or "too many" in err:
+                if delay is not None:
+                    time.sleep(delay)
+                    continue
+            return None
+    return None
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_realtime(symbol):
     try:
-        from src.data.realtime import RealTimeFetcher
-        rt = RealTimeFetcher()
-        return rt.get_quote(symbol)
+        import yfinance as yf
+        yahoo_sym = BVC_TICKERS.get(symbol, {}).get("yahoo", symbol + ".CS")
+        ticker = yf.Ticker(yahoo_sym)
+        info = ticker.fast_info
+        return {
+            "price": getattr(info, "last_price", None),
+            "open": getattr(info, "open", None),
+            "high": getattr(info, "day_high", None),
+            "low": getattr(info, "day_low", None),
+            "volume": getattr(info, "last_volume", None),
+            "high_52w": getattr(info, "year_high", None),
+            "low_52w": getattr(info, "year_low", None),
+        }
     except Exception:
         return None
 
@@ -120,16 +148,14 @@ if page == "🔍 Analyse":
     st.title(f"{selected_symbol} — {info.get('name', '')}")
     st.caption(f"Secteur: {info.get('secteur', '—')}  ·  Yahoo: {info.get('yahoo', '—')}")
 
-    # Quote temps réel
     with st.spinner("Récupération des données..."):
         df = fetch_data(selected_symbol, period)
         qt = fetch_realtime(selected_symbol)
 
     if df is None or df.empty:
-        st.error("Aucune donnée disponible pour ce symbole.")
+        st.warning("⏳ Yahoo Finance limite les requêtes depuis les serveurs cloud. Réessaie dans quelques secondes.")
         st.stop()
 
-    # ── KPIs ──────────────────────────────────────────────────────────────────
     last = df["Close"].iloc[-1]
     prev = df["Close"].iloc[-2] if len(df) > 1 else last
     var_1j = (last - prev) / prev * 100
@@ -139,11 +165,11 @@ if page == "🔍 Analyse":
               delta=f"{var_1j:+.2f}%",
               delta_color="normal")
 
-    if qt:
-        c2.metric("Ouverture", f"{qt.open_:.2f}")
-        c3.metric("Haut", f"{qt.high:.2f}")
-        c4.metric("Bas", f"{qt.low:.2f}")
-        c5.metric("Volume", f"{int(qt.volume):,}" if qt.volume else "—")
+    if qt and qt.get("open"):
+        c2.metric("Ouverture", f"{qt['open']:.2f}")
+        c3.metric("Haut", f"{qt['high']:.2f}")
+        c4.metric("Bas", f"{qt['low']:.2f}")
+        c5.metric("Volume", f"{int(qt['volume']):,}" if qt.get("volume") else "—")
     else:
         c2.metric("Haut 52s", f"{df['High'].tail(252).max():.2f}")
         c3.metric("Bas 52s", f"{df['Low'].tail(252).min():.2f}")
@@ -152,7 +178,6 @@ if page == "🔍 Analyse":
 
     st.divider()
 
-    # ── Analyse technique ─────────────────────────────────────────────────────
     col_chart, col_report = st.columns([2, 1])
 
     with col_chart:
@@ -192,12 +217,10 @@ if page == "🔍 Analyse":
                 from src.analysis import TechnicalAnalyzer
                 analyzer = TechnicalAnalyzer(df)
                 score_data = analyzer.score()
-                summ = analyzer.summary()
 
                 score = score_data["score"]
                 reco = score_data["recommandation"]
 
-                # Score gauge
                 score_color = "#00d4aa" if score > 0 else "#ff4b4b"
                 st.markdown(f"""
                 <div style="text-align:center; padding:20px; background:#1a1d27;
@@ -211,12 +234,10 @@ if page == "🔍 Analyse":
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Rapport texte (dans expander)
                 with st.expander("Rapport complet", expanded=False):
                     report_txt = analyzer.full_report(include_patterns=False)
                     st.text(report_txt)
 
-                # Signaux
                 st.subheader("Signaux")
                 signals = analyzer.get_signals()
                 for sig in signals[:8]:
@@ -252,7 +273,7 @@ elif page == "📊 Dashboard":
         df = fetch_data(selected_symbol, period)
 
     if df is None or df.empty:
-        st.error("Aucune donnée disponible.")
+        st.warning("⏳ Données indisponibles. Réessaie dans quelques secondes.")
         st.stop()
 
     with st.spinner("Génération du dashboard 8 panneaux..."):
@@ -295,7 +316,7 @@ elif page == "📊 Dashboard":
 elif page == "🌐 Multi-Timeframe":
     st.title(f"Multi-Timeframe — {selected_symbol}")
 
-    with st.spinner("Chargement des 3 timeframes (journalier / hebdo / mensuel)..."):
+    with st.spinner("Chargement des 3 timeframes..."):
         try:
             from src.analysis.multi_timeframe import MultiTimeframeAnalyzer
             from src.visualization.mtf_charts import plot_mtf_overview, plot_mtf_confluence
@@ -305,7 +326,6 @@ elif page == "🌐 Multi-Timeframe":
             mtf = MultiTimeframeAnalyzer(selected_symbol, timeframes=["1d", "1wk", "1mo"], fetcher=fetcher)
             mtf.run()
 
-            # Rapport texte
             with st.expander("Rapport MTF", expanded=True):
                 st.text(mtf.full_report())
 
@@ -345,52 +365,55 @@ elif page == "🏪 Marché":
             ["Tous"] + sorted(SECTORS),
         )
 
-    @st.cache_data(ttl=600, show_spinner=False)
+    @st.cache_data(ttl=1800, show_spinner=False)
     def fetch_market(per):
-        from src.data import BVCDataFetcher
-        fetcher = BVCDataFetcher()
-        return fetcher.get_market_overview(period=per)
+        rows = []
+        for sym, sym_info in list(BVC_TICKERS.items())[:25]:
+            df_s = fetch_data(sym, per)
+            if df_s is not None and not df_s.empty:
+                last = df_s["Close"].iloc[-1]
+                prev = df_s["Close"].iloc[-2] if len(df_s) > 1 else last
+                rows.append({
+                    "Symbole": sym,
+                    "Nom": sym_info.get("name", sym)[:28],
+                    "Secteur": sym_info.get("secteur", "—"),
+                    "Dernier cours": last,
+                    "Variation (%)": (last - prev) / prev * 100,
+                })
+            time.sleep(0.3)
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    with st.spinner("Récupération des données marché..."):
+    with st.spinner("Récupération des données marché (peut prendre ~30s)..."):
         overview = fetch_market(market_period)
 
-    if overview.empty:
-        st.error("Impossible de récupérer les données du marché.")
+    if overview is None or overview.empty:
+        st.warning("⏳ Données indisponibles — Yahoo Finance limite les requêtes. Réessaie dans 1 minute.")
+        st.stop()
     else:
-        # Filtre secteur
         if sector_filter != "Tous":
-            filtered = {s: info for s, info in BVC_TICKERS.items()
-                        if info.get("secteur") == sector_filter}
-            overview = overview[overview["Symbole"].isin(filtered.keys())]
+            filtered_syms = {s for s, i in BVC_TICKERS.items() if i.get("secteur") == sector_filter}
+            overview = overview[overview["Symbole"].isin(filtered_syms)]
 
-        # KPIs marché
         var = overview["Variation (%)"]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Valeurs analysées", len(overview))
-        c2.metric("En hausse", int((var > 0).sum()), delta=None)
-        c3.metric("En baisse", int((var < 0).sum()), delta=None)
+        c2.metric("En hausse", int((var > 0).sum()))
+        c3.metric("En baisse", int((var < 0).sum()))
         c4.metric("Variation moyenne", f"{var.mean():+.2f}%",
-                  delta_color="normal", delta=f"{var.mean():+.2f}%")
+                  delta=f"{var.mean():+.2f}%", delta_color="normal")
 
         st.divider()
 
-        # Tableau stylisé
-        def style_var(val):
-            color_css = "color: #00d4aa" if val >= 0 else "color: #ff4b4b"
-            return color_css
-
-        display = overview.copy()
-        display = display.sort_values("Variation (%)", ascending=False)
-
+        display = overview.sort_values("Variation (%)", ascending=False)
         st.dataframe(
             display.style
-                .applymap(style_var, subset=["Variation (%)"])
+                .applymap(lambda v: "color: #00d4aa" if v >= 0 else "color: #ff4b4b",
+                          subset=["Variation (%)"])
                 .format({"Dernier cours": "{:.2f}", "Variation (%)": "{:+.2f}%"}),
             use_container_width=True,
             height=600,
         )
 
-        # Graphique variation
         st.subheader("Variation par action")
         fig, ax = plt.subplots(figsize=(14, 5), facecolor="#0e1117")
         ax.set_facecolor("#0e1117")
@@ -444,17 +467,14 @@ elif page == "⚖️ Comparaison":
                 from src.analysis import TechnicalAnalyzer
                 analyzer = TechnicalAnalyzer(df_s)
                 score_data = analyzer.score()
-                summ = analyzer.summary()
                 last_price = df_s["Close"].iloc[-1]
                 prev_price = df_s["Close"].iloc[-2]
-                var_1j = (last_price - prev_price) / prev_price * 100
-                var_total = (df_s["Close"].iloc[-1] / df_s["Close"].iloc[0] - 1) * 100
                 results.append({
                     "Symbole": sym,
                     "Nom": BVC_TICKERS[sym]["name"][:30],
                     "Cours": last_price,
-                    "1j (%)": var_1j,
-                    f"Perf. {compare_period} (%)": var_total,
+                    "1j (%)": (last_price - prev_price) / prev_price * 100,
+                    f"Perf. {compare_period} (%)": (df_s["Close"].iloc[-1] / df_s["Close"].iloc[0] - 1) * 100,
                     "Score": score_data["score"],
                     "Signal": score_data["recommandation"],
                 })
@@ -464,8 +484,6 @@ elif page == "⚖️ Comparaison":
 
     if results:
         df_res = pd.DataFrame(results).set_index("Symbole")
-
-        # Tableau comparatif
         st.subheader("Tableau comparatif")
         st.dataframe(
             df_res.style
@@ -480,20 +498,17 @@ elif page == "⚖️ Comparaison":
             use_container_width=True,
         )
 
-    # Graphique évolution des cours
     if close_data:
         st.subheader("Évolution des cours")
         fig, ax = plt.subplots(figsize=(14, 6), facecolor="#0e1117")
         ax.set_facecolor("#0e1117")
         palette = ["#00d4aa", "#4fc3f7", "#ffb74d", "#f48fb1", "#ce93d8",
                    "#80cbc4", "#a5d6a7", "#fff176", "#ff8a65", "#90a4ae"]
-
         for i, (sym, series) in enumerate(close_data.items()):
             if normalize:
                 series = series / series.iloc[0] * 100
             ax.plot(series.index, series.values, label=sym,
                     color=palette[i % len(palette)], linewidth=1.8)
-
         ax.legend(facecolor="#1a1d27", edgecolor="#444", labelcolor="#ddd")
         ax.tick_params(colors="#aaa")
         ax.set_ylabel("Base 100" if normalize else "MAD", color="#aaa")
