@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data import BVCDataFetcher
 from src.data.tickers import BVC_TICKERS, list_sectors, get_ticker_info
 from src.analysis import TechnicalAnalyzer
+from src.analysis.multi_timeframe import MultiTimeframeAnalyzer, TIMEFRAME_LABELS
 
 
 def setup_logging(verbose: bool = False):
@@ -163,6 +164,85 @@ def cmd_liste(args):
     print(f"Secteurs: {', '.join(list_sectors())}")
 
 
+def cmd_mtf(args):
+    """Analyse multi-timeframes d'un symbole."""
+    symbol = args.symbole
+    tfs = ["1d", "1wk", "1mo"]
+
+    print(f"\nAnalyse multi-timeframes de {symbol}...")
+    print("─" * 50)
+    try:
+        mtf = MultiTimeframeAnalyzer(symbol, timeframes=tfs)
+        mtf.run()
+        print(mtf.full_report())
+    except Exception as e:
+        print(f"Erreur MTF: {e}")
+        return
+
+    if args.chart or args.save:
+        try:
+            from src.visualization.mtf_charts import plot_mtf_overview, plot_mtf_confluence
+            import matplotlib.pyplot as plt
+
+            save_overview = f"{symbol}_MTF_overview.png" if args.save else None
+            save_confluence = f"{symbol}_MTF_confluence.png" if args.save else None
+
+            fig1 = plot_mtf_overview(mtf, save_path=save_overview)
+            fig2 = plot_mtf_confluence(mtf, save_path=save_confluence)
+
+            if args.chart and not args.save:
+                plt.show()
+            plt.close(fig1)
+            plt.close(fig2)
+
+        except ImportError as e:
+            print(f"Impossible d'afficher les graphiques: {e}")
+
+
+def cmd_timeframe(args):
+    """Analyse avec un timeframe spécifique (journalier, hebdo ou mensuel)."""
+    tf_map = {
+        "journalier": "1d", "j": "1d", "daily": "1d", "1d": "1d",
+        "hebdomadaire": "1wk", "h": "1wk", "weekly": "1wk", "1wk": "1wk",
+        "mensuel": "1mo", "m": "1mo", "monthly": "1mo", "1mo": "1mo",
+    }
+    tf = tf_map.get(args.timeframe.lower(), "1d")
+    label = TIMEFRAME_LABELS.get(tf, tf)
+
+    fetcher = BVCDataFetcher()
+    from src.analysis.multi_timeframe import TIMEFRAME_PERIOD
+    period = TIMEFRAME_PERIOD.get(tf, "2y")
+
+    print(f"\nAnalyse {label} de {args.symbole} ({period})...")
+    try:
+        df = fetcher.get_ohlcv(args.symbole, period=period, interval=tf)
+    except Exception as e:
+        print(f"Erreur: {e}")
+        return
+
+    if df.empty:
+        print("Aucune donnée disponible.")
+        return
+
+    analyzer = TechnicalAnalyzer(df)
+    print(analyzer.full_report())
+
+    if args.chart or args.save:
+        try:
+            from src.visualization.mtf_charts import plot_timeframe
+            import matplotlib.pyplot as plt
+
+            save_path = f"{args.symbole}_{tf}.png" if args.save else None
+            fig = plot_timeframe(df, timeframe=tf, save_path=save_path)
+
+            if args.chart and not args.save:
+                plt.show()
+            plt.close(fig)
+
+        except ImportError as e:
+            print(f"Impossible d'afficher le graphique: {e}")
+
+
 def cmd_compare(args):
     """Compare plusieurs actions."""
     fetcher = BVCDataFetcher()
@@ -207,6 +287,10 @@ Exemples:
   python scripts/analyze.py ATW
   python scripts/analyze.py IAM --period 6mo --chart
   python scripts/analyze.py BCP --period 1y --chart --save
+  python scripts/analyze.py ATW --mtf
+  python scripts/analyze.py ATW --mtf --chart
+  python scripts/analyze.py ATW --timeframe hebdomadaire --chart
+  python scripts/analyze.py ATW --timeframe mensuel --save
   python scripts/analyze.py --marche
   python scripts/analyze.py --secteur Banques
   python scripts/analyze.py --comparer ATW,BCP,BOA
@@ -229,6 +313,11 @@ Exemples:
                         help="Lister toutes les actions disponibles")
     parser.add_argument("--comparer", metavar="S1,S2,...",
                         help="Comparer plusieurs symboles (séparés par virgules)")
+    parser.add_argument("--mtf", action="store_true",
+                        help="Analyse multi-timeframes (journalier + hebdo + mensuel)")
+    parser.add_argument("--timeframe", "-t",
+                        metavar="TF",
+                        help="Timeframe spécifique: journalier|hebdomadaire|mensuel (ou 1d|1wk|1mo)")
     parser.add_argument("--no-patterns", action="store_true",
                         help="Désactiver l'affichage des patterns sur le graphique")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -246,11 +335,18 @@ Exemples:
     elif args.comparer:
         args.symboles = args.comparer
         cmd_compare(args)
+    elif args.symbole and args.mtf:
+        cmd_mtf(args)
+    elif args.symbole and args.timeframe:
+        cmd_timeframe(args)
     elif args.symbole:
         cmd_analyze(args)
     else:
         parser.print_help()
-        print("\nExemple rapide: python scripts/analyze.py ATW --chart")
+        print("\nExemples rapides:")
+        print("  python scripts/analyze.py ATW --chart")
+        print("  python scripts/analyze.py ATW --mtf --chart")
+        print("  python scripts/analyze.py ATW --timeframe hebdomadaire --chart")
 
 
 if __name__ == "__main__":
