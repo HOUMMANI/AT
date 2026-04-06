@@ -35,17 +35,17 @@ PERIODS = {
 }
 
 
-def fetch_symbol(yahoo_sym: str, days: int = 365) -> pd.DataFrame:
-    """Fetch avec retry depuis GitHub Actions (pas de rate-limit Yahoo)."""
+def fetch_symbol(yahoo_sym: str) -> pd.DataFrame:
+    """Fetch 5 ans d'historique avec retry."""
     for attempt in range(3):
         try:
             ticker = yf.Ticker(yahoo_sym)
-            df = ticker.history(period=f"{days}d", auto_adjust=True)
+            df = ticker.history(period="5y", auto_adjust=True)
             if df is not None and not df.empty:
                 return df[["Open", "High", "Low", "Close", "Volume"]]
         except Exception as e:
             print(f"  Tentative {attempt+1}/3 échouée pour {yahoo_sym}: {e}")
-            time.sleep(2 ** attempt)
+            time.sleep(3 ** attempt)
     return pd.DataFrame()
 
 
@@ -69,7 +69,7 @@ def main():
     ok, fail = 0, 0
     for sym, yahoo_sym in SYMBOLS.items():
         print(f"Fetching {sym} ({yahoo_sym})...")
-        df = fetch_symbol(yahoo_sym, days=365 * 5)  # 5 ans d'historique
+        df = fetch_symbol(yahoo_sym)
         if not df.empty:
             save_cache(sym, df)
             ok += 1
