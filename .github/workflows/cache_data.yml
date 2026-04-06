@@ -2,7 +2,6 @@ name: Cache BVC Data
 
 on:
   schedule:
-    # Tous les jours à 16h30 UTC+1 (après fermeture BVC 15h30)
     - cron: '30 15 * * 1-5'
   workflow_dispatch:
 
@@ -16,6 +15,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -28,10 +29,14 @@ jobs:
       - name: Fetch and cache BVC data
         run: python scripts/cache_data.py
 
-      - name: Commit and push cache
+      - name: Push cache to data-cache branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Créer ou basculer sur la branche data-cache
+          git checkout --orphan data-cache 2>/dev/null || git checkout data-cache
           git add data/cache/
-          git diff --staged --quiet || git commit -m "chore: update BVC data cache [skip ci]"
-          git push
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "chore: update BVC data cache $(date +%Y-%m-%d)"
+          git push origin data-cache --force
+

@@ -44,30 +44,46 @@ _PERIOD_SECONDS = {
 }
 
 
+# URL raw GitHub pour le cache (branche data-cache, pas de rate-limit)
+_CACHE_RAW_URL = "https://raw.githubusercontent.com/HOUMMANI/AT/data-cache/data/cache/{symbol}.csv"
+
+
 def _read_csv_cache(symbol: str, period: str = "1y") -> pd.DataFrame:
     """
-    Lit les données depuis le cache CSV mis à jour par GitHub Actions.
-    Filtre selon la période demandée.
+    Lit les données depuis le cache CSV (branche data-cache sur GitHub).
+    Essaie d'abord le fichier local, puis l'URL raw GitHub.
     """
+    df = pd.DataFrame()
+
+    # 1. Fichier local (si présent — ex: développement local)
     path = os.path.join(_CACHE_DIR, f"{symbol}.csv")
-    if not os.path.exists(path):
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path, index_col="Date", parse_dates=True)
+        except Exception:
+            pass
+
+    # 2. URL raw GitHub (Streamlit Cloud lit directement depuis la branche data-cache)
+    if df.empty:
+        try:
+            url = _CACHE_RAW_URL.format(symbol=symbol)
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                from io import StringIO
+                df = pd.read_csv(StringIO(resp.text), index_col="Date", parse_dates=True)
+        except Exception as e:
+            logger.debug(f"Cache raw URL échec pour {symbol}: {e}")
+
+    if df.empty:
         return pd.DataFrame()
 
-    try:
-        df = pd.read_csv(path, index_col="Date", parse_dates=True)
-        if df.empty:
-            return pd.DataFrame()
+    # Filtrer par période
+    secs = _PERIOD_SECONDS.get(period)
+    if secs:
+        cutoff = datetime.now() - timedelta(seconds=secs)
+        df = df[df.index >= cutoff]
 
-        # Filtrer par période
-        secs = _PERIOD_SECONDS.get(period)
-        if secs:
-            cutoff = datetime.now() - timedelta(seconds=secs)
-            df = df[df.index >= cutoff]
-
-        return df if not df.empty else pd.DataFrame()
-    except Exception as e:
-        logger.debug(f"Cache CSV lecture échouée pour {symbol}: {e}")
-        return pd.DataFrame()
+    return df if not df.empty else pd.DataFrame()
 
 
 def _fetch_yahoo_direct(
