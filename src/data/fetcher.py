@@ -1,13 +1,15 @@
 """
 Module de récupération des données de marché pour la BVC.
 Sources (par ordre de priorité) :
-  1. Yahoo Finance API directe — appel HTTP navigateur, contourne le rate-limit yfinance
-  2. yfinance library          — fallback avec retry exponentiel
+  1. Cache CSV local (data/cache/) — mis à jour par GitHub Actions quotidiennement
+  2. Yahoo Finance API directe   — appel HTTP navigateur
+  3. yfinance library             — fallback avec retry
 """
 
 import pandas as pd
 import yfinance as yf
 import requests
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 import logging
@@ -17,7 +19,12 @@ from .tickers import BVC_TICKERS, get_ticker_info
 
 logger = logging.getLogger(__name__)
 
-# Headers qui imitent un navigateur Chrome — contourne les blocages API Yahoo
+# Répertoire du cache CSV (peuplé par GitHub Actions)
+_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    "data", "cache"
+)
+
 _YAHOO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,7 +34,6 @@ _YAHOO_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
     "Referer": "https://finance.yahoo.com/",
-    "Origin": "https://finance.yahoo.com",
 }
 
 _PERIOD_SECONDS = {
@@ -38,6 +44,32 @@ _PERIOD_SECONDS = {
 }
 
 
+def _read_csv_cache(symbol: str, period: str = "1y") -> pd.DataFrame:
+    """
+    Lit les données depuis le cache CSV mis à jour par GitHub Actions.
+    Filtre selon la période demandée.
+    """
+    path = os.path.join(_CACHE_DIR, f"{symbol}.csv")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path, index_col="Date", parse_dates=True)
+        if df.empty:
+            return pd.DataFrame()
+
+        # Filtrer par période
+        secs = _PERIOD_SECONDS.get(period)
+        if secs:
+            cutoff = datetime.now() - timedelta(seconds=secs)
+            df = df[df.index >= cutoff]
+
+        return df if not df.empty else pd.DataFrame()
+    except Exception as e:
+        logger.debug(f"Cache CSV lecture échouée pour {symbol}: {e}")
+        return pd.DataFrame()
+
+
 def _fetch_yahoo_direct(
     yahoo_ticker: str,
     period: str = "1y",
@@ -45,43 +77,36 @@ def _fetch_yahoo_direct(
     end: Optional[str] = None,
     interval: str = "1d",
 ) -> pd.DataFrame:
-    """
-    Appel direct à l'API Yahoo Finance v8 sans passer par la librairie yfinance.
-    Utilise des headers navigateur pour contourner le rate-limit.
-    """
+    """Appel direct à l'API Yahoo Finance v8 avec headers navigateur."""
     now_ts = int(time.time())
 
     if start:
         start_ts = int(datetime.strptime(start, "%Y-%m-%d").timestamp())
     else:
         secs = _PERIOD_SECONDS.get(period)
-        if secs is None:  # ytd
+        if secs is None:
             secs = int((datetime.now() - datetime(datetime.now().year, 1, 1)).total_seconds())
         start_ts = now_ts - secs
 
     end_ts = int(datetime.strptime(end, "%Y-%m-%d").timestamp()) if end else now_ts
 
-    # Alterner entre query1 et query2 pour répartir la charge
     for base in ["query2", "query1"]:
         url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
         params = {
-            "period1": start_ts,
-            "period2": end_ts,
-            "interval": interval,
-            "events": "history",
+            "period1": start_ts, "period2": end_ts,
+            "interval": interval, "events": "history",
             "includeAdjustedClose": "true",
         }
         try:
             resp = requests.get(url, headers=_YAHOO_HEADERS, params=params, timeout=15)
             if resp.status_code == 429:
-                logger.warning(f"Yahoo {base} rate-limit pour {yahoo_ticker}")
                 time.sleep(2)
                 continue
             if resp.status_code != 200:
                 continue
 
             data = resp.json()
-            result = data.get("chart", {}).get("result") or []
+            result = (data.get("chart", {}).get("result") or [])
             if not result:
                 continue
 
@@ -95,10 +120,8 @@ def _fetch_yahoo_direct(
             closes = (adj[0].get("adjclose") if adj else None) or quote["close"]
 
             df = pd.DataFrame({
-                "Open": quote["open"],
-                "High": quote["high"],
-                "Low": quote["low"],
-                "Close": closes,
+                "Open": quote["open"], "High": quote["high"],
+                "Low": quote["low"], "Close": closes,
                 "Volume": quote["volume"],
             }, index=pd.to_datetime(timestamps, unit="s", utc=True))
 
@@ -166,9 +189,13 @@ class BVCDataFetcher:
         if cache_key in self._cache:
             return self._cache[cache_key].copy()
 
-        # ── 1. API Yahoo directe (headers navigateur) ─────────────────────────
-        df = _fetch_yahoo_direct(yahoo_ticker, period=period, start=start,
-                                  end=end, interval=interval)
+        # ── 1. Cache CSV (GitHub Actions, aucun appel API) ────────────────────
+        df = _read_csv_cache(symbol, period=period)
+
+        # ── 2. API Yahoo directe (headers navigateur) ─────────────────────────
+        if df.empty:
+            df = _fetch_yahoo_direct(yahoo_ticker, period=period, start=start,
+                                      end=end, interval=interval)
 
         # ── 2. Fallback yfinance avec retry ────────────────────────────────────
         if df.empty:
