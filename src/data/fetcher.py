@@ -1,14 +1,15 @@
 """
 Module de récupération des données de marché pour la BVC.
 Sources (par ordre de priorité) :
-  1. Stooq      — via pandas_datareader, gratuit, pas de rate-limit
-  2. Yahoo Finance — fallback via yfinance
+  1. Yahoo Finance API directe — appel HTTP navigateur, contourne le rate-limit yfinance
+  2. yfinance library          — fallback avec retry exponentiel
 """
 
 import pandas as pd
 import yfinance as yf
+import requests
 from datetime import datetime, timedelta
-from typing import Optional, Union
+from typing import Optional
 import logging
 import time
 
@@ -16,80 +17,114 @@ from .tickers import BVC_TICKERS, get_ticker_info
 
 logger = logging.getLogger(__name__)
 
+# Headers qui imitent un navigateur Chrome — contourne les blocages API Yahoo
+_YAHOO_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "Referer": "https://finance.yahoo.com/",
+    "Origin": "https://finance.yahoo.com",
+}
 
-def _period_to_start(period: str) -> datetime:
-    """Convertit une période (ex: '1y') en date de début."""
-    now = datetime.now()
-    mapping = {
-        "1d": timedelta(days=1), "5d": timedelta(days=5),
-        "1mo": timedelta(days=31), "3mo": timedelta(days=92),
-        "6mo": timedelta(days=183), "1y": timedelta(days=365),
-        "2y": timedelta(days=730), "5y": timedelta(days=1825),
-        "10y": timedelta(days=3650), "ytd": timedelta(days=(now - datetime(now.year, 1, 1)).days),
-        "max": timedelta(days=7300),
-    }
-    return now - mapping.get(period, timedelta(days=365))
+_PERIOD_SECONDS = {
+    "1d": 86400, "5d": 432000,
+    "1mo": 2678400, "3mo": 8035200, "6mo": 16070400,
+    "1y": 31536000, "2y": 63072000, "5y": 157680000,
+    "10y": 315360000, "ytd": None, "max": 788400000,
+}
 
 
-def _fetch_stooq(yahoo_ticker: str, period: str = "1y",
-                 start: Optional[str] = None, end: Optional[str] = None,
-                 interval: str = "1d") -> pd.DataFrame:
+def _fetch_yahoo_direct(
+    yahoo_ticker: str,
+    period: str = "1y",
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    interval: str = "1d",
+) -> pd.DataFrame:
     """
-    Récupère les données depuis Stooq via pandas_datareader.
-    Stooq utilise le même suffixe .CS que Yahoo pour les actions marocaines.
-    Supporte uniquement interval=1d/1wk/1mo (pas d'intraday).
+    Appel direct à l'API Yahoo Finance v8 sans passer par la librairie yfinance.
+    Utilise des headers navigateur pour contourner le rate-limit.
     """
-    if interval not in ("1d", "1wk", "1mo"):
-        return pd.DataFrame()
+    now_ts = int(time.time())
 
-    try:
-        from pandas_datareader import data as pdr
+    if start:
+        start_ts = int(datetime.strptime(start, "%Y-%m-%d").timestamp())
+    else:
+        secs = _PERIOD_SECONDS.get(period)
+        if secs is None:  # ytd
+            secs = int((datetime.now() - datetime(datetime.now().year, 1, 1)).total_seconds())
+        start_ts = now_ts - secs
 
-        # Stooq: le symbole doit être en minuscules
-        stooq_sym = yahoo_ticker.lower()
+    end_ts = int(datetime.strptime(end, "%Y-%m-%d").timestamp()) if end else now_ts
 
-        dt_start = datetime.strptime(start, "%Y-%m-%d") if start else _period_to_start(period)
-        dt_end = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now()
+    # Alterner entre query1 et query2 pour répartir la charge
+    for base in ["query2", "query1"]:
+        url = f"https://{base}.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
+        params = {
+            "period1": start_ts,
+            "period2": end_ts,
+            "interval": interval,
+            "events": "history",
+            "includeAdjustedClose": "true",
+        }
+        try:
+            resp = requests.get(url, headers=_YAHOO_HEADERS, params=params, timeout=15)
+            if resp.status_code == 429:
+                logger.warning(f"Yahoo {base} rate-limit pour {yahoo_ticker}")
+                time.sleep(2)
+                continue
+            if resp.status_code != 200:
+                continue
 
-        df = pdr.DataReader(stooq_sym, "stooq", start=dt_start, end=dt_end)
+            data = resp.json()
+            result = data.get("chart", {}).get("result") or []
+            if not result:
+                continue
 
-        if df is None or df.empty:
-            return pd.DataFrame()
+            r = result[0]
+            timestamps = r.get("timestamp", [])
+            if not timestamps:
+                continue
 
-        df = df.sort_index()
-        df.index = pd.to_datetime(df.index)
-        if df.index.tz is not None:
+            quote = r["indicators"]["quote"][0]
+            adj = r["indicators"].get("adjclose", [{}])
+            closes = (adj[0].get("adjclose") if adj else None) or quote["close"]
+
+            df = pd.DataFrame({
+                "Open": quote["open"],
+                "High": quote["high"],
+                "Low": quote["low"],
+                "Close": closes,
+                "Volume": quote["volume"],
+            }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+
             df.index = df.index.tz_localize(None)
+            df.index.name = "Date"
+            df = df.sort_index().dropna(subset=["Close"])
+            if not df.empty:
+                return df
 
-        # Stooq renvoie Open/High/Low/Close/Volume
-        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+        except Exception as e:
+            logger.debug(f"Yahoo direct {base} échec pour {yahoo_ticker}: {e}")
 
-        # Rééchantillonner si hebdo ou mensuel
-        if interval == "1wk":
-            df = df.resample("W").agg({
-                "Open": "first", "High": "max", "Low": "min",
-                "Close": "last", "Volume": "sum"
-            }).dropna()
-        elif interval == "1mo":
-            df = df.resample("ME").agg({
-                "Open": "first", "High": "max", "Low": "min",
-                "Close": "last", "Volume": "sum"
-            }).dropna()
-
-        return df
-
-    except Exception as e:
-        logger.debug(f"Stooq échec pour {yahoo_ticker}: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
 class BVCDataFetcher:
     """
     Récupère les données historiques des actions de la Bourse de Casablanca.
 
-    Exemple d'utilisation:
+    Stratégie :
+      1. Appel HTTP direct à l'API Yahoo (headers navigateur) — pas de rate-limit
+      2. Fallback yfinance library avec retry exponentiel
+
+    Exemple :
         fetcher = BVCDataFetcher()
-        df = fetcher.get_ohlcv("ATW")  # Attijariwafa Bank
+        df = fetcher.get_ohlcv("ATW")
         df = fetcher.get_ohlcv("IAM", period="1y")
     """
 
@@ -100,15 +135,12 @@ class BVCDataFetcher:
         self._cache = {}
 
     def _resolve_yahoo_ticker(self, symbol: str) -> str:
-        """Convertit un symbole BVC en ticker Yahoo Finance."""
         symbol = symbol.upper()
         info = get_ticker_info(symbol)
         if info:
             return info.get("yahoo", symbol)
-        # Si déjà au format Yahoo (.CS) ou indice (^), retourner tel quel
         if symbol.endswith(".CS") or symbol.startswith("^"):
             return symbol
-        # Ajouter suffixe .CS par défaut
         return f"{symbol}.CS"
 
     def get_ohlcv(
@@ -120,22 +152,13 @@ class BVCDataFetcher:
         end: Optional[str] = None,
     ) -> pd.DataFrame:
         """
-        Récupère les données OHLCV (Open, High, Low, Close, Volume) d'une action.
-
-        Args:
-            symbol: Symbole BVC (ex: "ATW", "IAM") ou ticker Yahoo (ex: "ATW.CS")
-            period: Période ("1d","5d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max")
-            interval: Intervalle des données ("1d","1wk","1mo")
-            start: Date de début au format "YYYY-MM-DD" (prioritaire sur period)
-            end: Date de fin au format "YYYY-MM-DD"
-
-        Returns:
-            DataFrame avec colonnes: Open, High, Low, Close, Volume
+        Récupère les données OHLCV.
+        Essaie l'API directe Yahoo en premier, yfinance en fallback.
         """
         if period not in self.VALID_PERIODS:
             raise ValueError(f"Période invalide: {period}. Valeurs possibles: {self.VALID_PERIODS}")
         if interval not in self.VALID_INTERVALS:
-            raise ValueError(f"Intervalle invalide: {interval}. Valeurs possibles: {self.VALID_INTERVALS}")
+            raise ValueError(f"Intervalle invalide: {interval}")
 
         yahoo_ticker = self._resolve_yahoo_ticker(symbol)
         cache_key = f"{yahoo_ticker}_{period}_{interval}_{start}_{end}"
@@ -143,35 +166,35 @@ class BVCDataFetcher:
         if cache_key in self._cache:
             return self._cache[cache_key].copy()
 
-        # ── 1. Essayer Stooq (pas de rate-limit, fiable sur serveurs cloud) ──────
-        df = _fetch_stooq(yahoo_ticker, period=period, start=start, end=end, interval=interval)
+        # ── 1. API Yahoo directe (headers navigateur) ─────────────────────────
+        df = _fetch_yahoo_direct(yahoo_ticker, period=period, start=start,
+                                  end=end, interval=interval)
 
-        # ── 2. Fallback Yahoo Finance avec retry ─────────────────────────────
+        # ── 2. Fallback yfinance avec retry ────────────────────────────────────
         if df.empty:
-            delays = [2, 6, 15]
-            for delay in delays + [None]:
+            for delay in [3, 8, 20, None]:
                 try:
                     ticker = yf.Ticker(yahoo_ticker)
-                    if start:
-                        df = ticker.history(start=start, end=end, interval=interval)
-                    else:
-                        df = ticker.history(period=period, interval=interval)
-                    if not df.empty:
+                    df = ticker.history(
+                        period=period if not start else "max",
+                        start=start, end=end, interval=interval
+                    )
+                    if df is not None and not df.empty:
                         break
                 except Exception as e:
                     err = str(e).lower()
                     if ("ratelimit" in err or "429" in err or "too many" in err) and delay:
-                        logger.warning(f"Yahoo rate-limit pour {symbol}, retry dans {delay}s")
+                        logger.warning(f"yfinance rate-limit {symbol}, retry {delay}s")
                         time.sleep(delay)
                     else:
-                        logger.error(f"Yahoo erreur pour {symbol}: {e}")
+                        logger.error(f"yfinance erreur {symbol}: {e}")
                         break
 
         if df is None or df.empty:
-            logger.warning(f"Aucune donnée disponible pour {symbol} ({yahoo_ticker})")
+            logger.warning(f"Aucune donnée pour {symbol} ({yahoo_ticker})")
             return pd.DataFrame()
 
-        # Nettoyer et standardiser
+        # Standardiser les colonnes
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             if col not in df.columns:
                 df[col] = 0
@@ -181,10 +204,10 @@ class BVCDataFetcher:
             df.index = df.index.tz_localize(None)
         df.index.name = "Date"
         df = df.sort_index()
-        df.attrs["symbol"] = symbol
-        df.attrs["yahoo_ticker"] = yahoo_ticker
 
         info = get_ticker_info(symbol)
+        df.attrs["symbol"] = symbol
+        df.attrs["yahoo_ticker"] = yahoo_ticker
         df.attrs["name"] = info.get("name", symbol) if info else symbol
         df.attrs["secteur"] = info.get("secteur", "N/A") if info else "N/A"
 
@@ -192,18 +215,7 @@ class BVCDataFetcher:
         logger.info(f"Données récupérées: {symbol} ({len(df)} lignes)")
         return df.copy()
 
-    def get_multiple(
-        self,
-        symbols: list,
-        period: str = "1y",
-        interval: str = "1d",
-    ) -> dict:
-        """
-        Récupère les données OHLCV de plusieurs actions.
-
-        Returns:
-            Dictionnaire {symbol: DataFrame}
-        """
+    def get_multiple(self, symbols: list, period: str = "1y", interval: str = "1d") -> dict:
         results = {}
         for symbol in symbols:
             try:
@@ -213,50 +225,38 @@ class BVCDataFetcher:
         return results
 
     def get_info(self, symbol: str) -> dict:
-        """Retourne les informations fondamentales d'une action."""
         yahoo_ticker = self._resolve_yahoo_ticker(symbol)
         try:
-            ticker = yf.Ticker(yahoo_ticker)
-            return ticker.info
-        except Exception as e:
-            logger.error(f"Erreur info {symbol}: {e}")
+            return yf.Ticker(yahoo_ticker).info
+        except Exception:
             return {}
 
     def get_sector_data(self, secteur: str, period: str = "1y") -> dict:
-        """Récupère les données de toutes les actions d'un secteur."""
         from .tickers import get_tickers_by_sector
-        tickers = get_tickers_by_sector(secteur)
-        return self.get_multiple(list(tickers.keys()), period=period)
+        return self.get_multiple(list(get_tickers_by_sector(secteur).keys()), period=period)
 
     def get_market_overview(self, period: str = "1mo") -> pd.DataFrame:
-        """
-        Retourne un aperçu du marché avec les variations des principales actions.
-        """
-        major = ["MASI", "ATW", "IAM", "BCP", "BOA", "CIH", "LHM", "MNG", "COSU", "LES"]
+        major = ["ATW", "IAM", "BCP", "BOA", "CIH", "LHM", "MNG", "COSU", "LES", "WAA"]
         data = self.get_multiple(major, period=period)
-
         rows = []
         for symbol, df in data.items():
             if df.empty:
                 continue
             first_close = df["Close"].iloc[0]
             last_close = df["Close"].iloc[-1]
-            variation = ((last_close - first_close) / first_close) * 100
             info = get_ticker_info(symbol)
             rows.append({
                 "Symbole": symbol,
                 "Nom": info.get("name", symbol) if info else symbol,
                 "Secteur": info.get("secteur", "N/A") if info else "N/A",
                 "Dernier cours": round(last_close, 2),
-                "Variation (%)": round(variation, 2),
+                "Variation (%)": round((last_close - first_close) / first_close * 100, 2),
                 "Volume moyen": int(df["Volume"].mean()),
             })
-
         overview = pd.DataFrame(rows)
         if not overview.empty:
             overview = overview.sort_values("Variation (%)", ascending=False)
         return overview
 
     def clear_cache(self):
-        """Vide le cache des données."""
         self._cache.clear()
