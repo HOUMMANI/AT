@@ -14,6 +14,7 @@ import matplotlib
 import time
 matplotlib.use("Agg")
 
+# ─── Config page ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="AT — Analyse Technique BVC",
     page_icon="📈",
@@ -21,6 +22,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ─── CSS dark theme léger ────────────────────────────────────────────────────
 st.markdown("""
 <style>
 [data-testid="stSidebar"] { background-color: #0e1117; }
@@ -37,6 +39,7 @@ h1, h2, h3 { color: #e0e0e0; }
 </style>
 """, unsafe_allow_html=True)
 
+# ─── Imports projet ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _load_tickers():
     from src.data.tickers import BVC_TICKERS, list_sectors
@@ -48,6 +51,7 @@ except Exception as e:
     st.error(f"Erreur de chargement des tickers: {e}")
     st.stop()
 
+# ─── Sidebar navigation ──────────────────────────────────────────────────────
 with st.sidebar:
     st.title("📈 AT — BVC")
     st.caption("Analyse Technique · Bourse de Casablanca")
@@ -61,6 +65,7 @@ with st.sidebar:
 
     st.divider()
 
+    # Symbole commun
     symbol_list = sorted(BVC_TICKERS.keys())
     symbol_names = {s: f"{s} — {BVC_TICKERS[s]['name']}" for s in symbol_list}
 
@@ -79,12 +84,12 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Données: Stooq / Yahoo Finance")
+    st.caption("Données: Yahoo Finance (BVC ~15 min delay)")
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_data(symbol, per):
-    """Stooq en priorité (pas de rate-limit), Yahoo Finance en fallback."""
+    """Stooq en priorité, Yahoo Finance en fallback."""
     from src.data.fetcher import BVCDataFetcher
     fetcher = BVCDataFetcher()
     df = fetcher.get_ohlcv(symbol, period=per)
@@ -104,6 +109,8 @@ def fetch_realtime(symbol):
             "high": getattr(info, "day_high", None),
             "low": getattr(info, "day_low", None),
             "volume": getattr(info, "last_volume", None),
+            "high_52w": getattr(info, "year_high", None),
+            "low_52w": getattr(info, "year_low", None),
         }
     except Exception:
         return None
@@ -126,20 +133,24 @@ if page == "🔍 Analyse":
     st.title(f"{selected_symbol} — {info.get('name', '')}")
     st.caption(f"Secteur: {info.get('secteur', '—')}  ·  Yahoo: {info.get('yahoo', '—')}")
 
+    # Quote temps réel
     with st.spinner("Récupération des données..."):
         df = fetch_data(selected_symbol, period)
         qt = fetch_realtime(selected_symbol)
 
     if df is None or df.empty:
-        st.warning("⏳ Données temporairement indisponibles. Réessaie dans quelques secondes.")
+        st.warning("⏳ Yahoo Finance limite les requêtes depuis les serveurs cloud. Réessaie dans quelques secondes.")
         st.stop()
 
+    # ── KPIs ──────────────────────────────────────────────────────────────────
     last = df["Close"].iloc[-1]
     prev = df["Close"].iloc[-2] if len(df) > 1 else last
     var_1j = (last - prev) / prev * 100
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Dernier cours", f"{last:.2f} MAD", delta=f"{var_1j:+.2f}%", delta_color="normal")
+    c1.metric("Dernier cours", f"{last:.2f} MAD",
+              delta=f"{var_1j:+.2f}%",
+              delta_color="normal")
 
     if qt and qt.get("open"):
         c2.metric("Ouverture", f"{qt['open']:.2f}")
@@ -154,6 +165,7 @@ if page == "🔍 Analyse":
 
     st.divider()
 
+    # ── Analyse technique ─────────────────────────────────────────────────────
     col_chart, col_report = st.columns([2, 1])
 
     with col_chart:
@@ -162,12 +174,15 @@ if page == "🔍 Analyse":
             ["Bollinger", "MACD", "RSI", "Patterns", "Fibonacci", "Trendlines"],
             default=["Bollinger", "RSI"],
         )
+
         with st.spinner("Calcul des indicateurs..."):
             try:
                 from src.analysis import TechnicalAnalyzer
                 from src.visualization.charts import plot_chart
+
                 analyzer = TechnicalAnalyzer(df)
                 df_ind = analyzer.compute_all()
+
                 fig = plot_chart(
                     df_ind,
                     show_volume=True,
@@ -190,23 +205,38 @@ if page == "🔍 Analyse":
                 from src.analysis import TechnicalAnalyzer
                 analyzer = TechnicalAnalyzer(df)
                 score_data = analyzer.score()
+                summ = analyzer.summary()
+
                 score = score_data["score"]
                 reco = score_data["recommandation"]
+
+                # Score gauge
                 score_color = "#00d4aa" if score > 0 else "#ff4b4b"
                 st.markdown(f"""
                 <div style="text-align:center; padding:20px; background:#1a1d27;
                             border-radius:12px; margin-bottom:16px;">
-                    <div style="font-size:42px; font-weight:bold; color:{score_color};">{score:+.1f}</div>
-                    <div style="font-size:18px; color:#aaa; margin-top:4px;">{reco}</div>
+                    <div style="font-size:42px; font-weight:bold; color:{score_color};">
+                        {score:+.1f}
+                    </div>
+                    <div style="font-size:18px; color:#aaa; margin-top:4px;">
+                        {reco}
+                    </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                # Rapport texte (dans expander)
                 with st.expander("Rapport complet", expanded=False):
-                    st.text(analyzer.full_report(include_patterns=False))
+                    report_txt = analyzer.full_report(include_patterns=False)
+                    st.text(report_txt)
+
+                # Signaux
                 st.subheader("Signaux")
-                for sig in analyzer.get_signals()[:8]:
+                signals = analyzer.get_signals()
+                for sig in signals[:8]:
                     icon = "🟢" if "ACHAT" in sig.upper() or "HAUSSIER" in sig.upper() else \
                            "🔴" if "VENTE" in sig.upper() or "BAISSIER" in sig.upper() else "🟡"
                     st.markdown(f"{icon} {sig}")
+
             except Exception as e:
                 st.error(f"Erreur analyse: {e}")
 
@@ -220,10 +250,13 @@ elif page == "📊 Dashboard":
 
     with st.sidebar:
         st.subheader("Overlays panel 2")
-        OVERLAYS_ALL = ["fibonacci", "trendlines", "ichimoku", "pivots",
-                        "patterns", "support_resistance", "regression", "candlestick_patterns"]
+        OVERLAYS_ALL = [
+            "fibonacci", "trendlines", "ichimoku", "pivots",
+            "patterns", "support_resistance", "regression", "candlestick_patterns"
+        ]
         selected_overlays = st.multiselect(
-            "Tracés avancés", OVERLAYS_ALL,
+            "Tracés avancés",
+            OVERLAYS_ALL,
             default=["fibonacci", "trendlines", "support_resistance"],
         )
         no_mtf = st.checkbox("Sans multi-timeframe", value=False)
@@ -232,22 +265,26 @@ elif page == "📊 Dashboard":
         df = fetch_data(selected_symbol, period)
 
     if df is None or df.empty:
-        st.warning("⏳ Données indisponibles. Réessaie dans quelques secondes.")
+        st.error("Aucune donnée disponible.")
         st.stop()
 
     with st.spinner("Génération du dashboard 8 panneaux..."):
         try:
             from src.analysis import TechnicalAnalyzer, MultiTimeframeAnalyzer
             from src.visualization.dashboard import plot_dashboard
+
             analyzer = TechnicalAnalyzer(df)
+
             mtf = None
             if not no_mtf:
                 try:
                     from src.data import BVCDataFetcher
-                    mtf = MultiTimeframeAnalyzer(selected_symbol, fetcher=BVCDataFetcher())
+                    fetcher = BVCDataFetcher()
+                    mtf = MultiTimeframeAnalyzer(selected_symbol, fetcher=fetcher)
                     mtf.run()
                 except Exception:
                     mtf = None
+
             fig = plot_dashboard(
                 df,
                 overlays=selected_overlays if selected_overlays else None,
@@ -258,6 +295,7 @@ elif page == "📊 Dashboard":
             )
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
+
         except Exception as e:
             st.error(f"Erreur dashboard: {e}")
             import traceback
@@ -270,27 +308,33 @@ elif page == "📊 Dashboard":
 elif page == "🌐 Multi-Timeframe":
     st.title(f"Multi-Timeframe — {selected_symbol}")
 
-    with st.spinner("Chargement des 3 timeframes..."):
+    with st.spinner("Chargement des 3 timeframes (journalier / hebdo / mensuel)..."):
         try:
             from src.analysis.multi_timeframe import MultiTimeframeAnalyzer
             from src.visualization.mtf_charts import plot_mtf_overview, plot_mtf_confluence
             from src.data import BVCDataFetcher
+
             fetcher = BVCDataFetcher()
             mtf = MultiTimeframeAnalyzer(selected_symbol, timeframes=["1d", "1wk", "1mo"], fetcher=fetcher)
             mtf.run()
+
+            # Rapport texte
             with st.expander("Rapport MTF", expanded=True):
                 st.text(mtf.full_report())
+
             col1, col2 = st.columns(2)
             with col1:
                 st.subheader("Vue d'ensemble")
                 fig1 = plot_mtf_overview(mtf)
                 st.pyplot(fig1, use_container_width=True)
                 plt.close(fig1)
+
             with col2:
                 st.subheader("Confluence")
                 fig2 = plot_mtf_confluence(mtf)
                 st.pyplot(fig2, use_container_width=True)
                 plt.close(fig2)
+
         except Exception as e:
             st.error(f"Erreur MTF: {e}")
             import traceback
@@ -305,9 +349,14 @@ elif page == "🏪 Marché":
 
     with st.sidebar:
         market_period = st.select_slider(
-            "Période marché", options=["1mo", "3mo", "6mo", "1y"], value="1mo",
+            "Période marché",
+            options=["1mo", "3mo", "6mo", "1y"],
+            value="1mo",
         )
-        sector_filter = st.selectbox("Secteur", ["Tous"] + sorted(SECTORS))
+        sector_filter = st.selectbox(
+            "Secteur",
+            ["Tous"] + sorted(SECTORS),
+        )
 
     @st.cache_data(ttl=1800, show_spinner=False)
     def fetch_market(per):
@@ -335,29 +384,43 @@ elif page == "🏪 Marché":
         overview = fetch_market(market_period)
 
     if overview is None or overview.empty:
-        st.warning("⏳ Données indisponibles. Réessaie dans quelques secondes.")
+        st.warning("⏳ Données indisponibles — Yahoo Finance limite les requêtes. Réessaie dans 1 minute.")
         st.stop()
     else:
+        # Filtre secteur
         if sector_filter != "Tous":
-            filtered_syms = {s for s, i in BVC_TICKERS.items() if i.get("secteur") == sector_filter}
-            overview = overview[overview["Symbole"].isin(filtered_syms)]
+            filtered = {s: info for s, info in BVC_TICKERS.items()
+                        if info.get("secteur") == sector_filter}
+            overview = overview[overview["Symbole"].isin(filtered.keys())]
 
+        # KPIs marché
         var = overview["Variation (%)"]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Valeurs analysées", len(overview))
-        c2.metric("En hausse", int((var > 0).sum()))
-        c3.metric("En baisse", int((var < 0).sum()))
-        c4.metric("Variation moyenne", f"{var.mean():+.2f}%", delta=f"{var.mean():+.2f}%", delta_color="normal")
+        c2.metric("En hausse", int((var > 0).sum()), delta=None)
+        c3.metric("En baisse", int((var < 0).sum()), delta=None)
+        c4.metric("Variation moyenne", f"{var.mean():+.2f}%",
+                  delta_color="normal", delta=f"{var.mean():+.2f}%")
 
         st.divider()
-        display = overview.sort_values("Variation (%)", ascending=False)
+
+        # Tableau stylisé
+        def style_var(val):
+            color_css = "color: #00d4aa" if val >= 0 else "color: #ff4b4b"
+            return color_css
+
+        display = overview.copy()
+        display = display.sort_values("Variation (%)", ascending=False)
+
         st.dataframe(
             display.style
-                .applymap(lambda v: "color: #00d4aa" if v >= 0 else "color: #ff4b4b", subset=["Variation (%)"])
+                .applymap(style_var, subset=["Variation (%)"])
                 .format({"Dernier cours": "{:.2f}", "Variation (%)": "{:+.2f}%"}),
-            use_container_width=True, height=600,
+            use_container_width=True,
+            height=600,
         )
 
+        # Graphique variation
         st.subheader("Variation par action")
         fig, ax = plt.subplots(figsize=(14, 5), facecolor="#0e1117")
         ax.set_facecolor("#0e1117")
@@ -380,13 +443,17 @@ elif page == "⚖️ Comparaison":
 
     with st.sidebar:
         compare_symbols = st.multiselect(
-            "Valeurs à comparer", symbol_list,
+            "Valeurs à comparer",
+            symbol_list,
             default=["ATW", "BCP", "IAM"] if all(s in symbol_list for s in ["ATW", "BCP", "IAM"])
                     else symbol_list[:3],
             format_func=lambda s: symbol_names[s],
         )
         compare_period = st.select_slider(
-            "Période", options=["1mo", "3mo", "6mo", "1y", "2y"], value="6mo", key="cmp_period",
+            "Période",
+            options=["1mo", "3mo", "6mo", "1y", "2y"],
+            value="6mo",
+            key="cmp_period",
         )
         normalize = st.checkbox("Normaliser (base 100)", value=True)
 
@@ -396,6 +463,7 @@ elif page == "⚖️ Comparaison":
 
     results = []
     close_data = {}
+
     progress = st.progress(0, text="Chargement...")
     for i, sym in enumerate(compare_symbols):
         progress.progress((i + 1) / len(compare_symbols), text=f"Chargement {sym}...")
@@ -406,14 +474,17 @@ elif page == "⚖️ Comparaison":
                 from src.analysis import TechnicalAnalyzer
                 analyzer = TechnicalAnalyzer(df_s)
                 score_data = analyzer.score()
+                summ = analyzer.summary()
                 last_price = df_s["Close"].iloc[-1]
                 prev_price = df_s["Close"].iloc[-2]
+                var_1j = (last_price - prev_price) / prev_price * 100
+                var_total = (df_s["Close"].iloc[-1] / df_s["Close"].iloc[0] - 1) * 100
                 results.append({
                     "Symbole": sym,
                     "Nom": BVC_TICKERS[sym]["name"][:30],
                     "Cours": last_price,
-                    "1j (%)": (last_price - prev_price) / prev_price * 100,
-                    f"Perf. {compare_period} (%)": (df_s["Close"].iloc[-1] / df_s["Close"].iloc[0] - 1) * 100,
+                    "1j (%)": var_1j,
+                    f"Perf. {compare_period} (%)": var_total,
                     "Score": score_data["score"],
                     "Signal": score_data["recommandation"],
                 })
@@ -423,29 +494,36 @@ elif page == "⚖️ Comparaison":
 
     if results:
         df_res = pd.DataFrame(results).set_index("Symbole")
+
+        # Tableau comparatif
         st.subheader("Tableau comparatif")
         st.dataframe(
             df_res.style
                 .applymap(lambda v: "color: #00d4aa" if v >= 0 else "color: #ff4b4b",
                           subset=["1j (%)", f"Perf. {compare_period} (%)", "Score"])
                 .format({
-                    "Cours": "{:.2f}", "1j (%)": "{:+.2f}%",
-                    f"Perf. {compare_period} (%)": "{:+.2f}%", "Score": "{:+.1f}",
+                    "Cours": "{:.2f}",
+                    "1j (%)": "{:+.2f}%",
+                    f"Perf. {compare_period} (%)": "{:+.2f}%",
+                    "Score": "{:+.1f}",
                 }),
             use_container_width=True,
         )
 
+    # Graphique évolution des cours
     if close_data:
         st.subheader("Évolution des cours")
         fig, ax = plt.subplots(figsize=(14, 6), facecolor="#0e1117")
         ax.set_facecolor("#0e1117")
         palette = ["#00d4aa", "#4fc3f7", "#ffb74d", "#f48fb1", "#ce93d8",
                    "#80cbc4", "#a5d6a7", "#fff176", "#ff8a65", "#90a4ae"]
+
         for i, (sym, series) in enumerate(close_data.items()):
             if normalize:
                 series = series / series.iloc[0] * 100
             ax.plot(series.index, series.values, label=sym,
                     color=palette[i % len(palette)], linewidth=1.8)
+
         ax.legend(facecolor="#1a1d27", edgecolor="#444", labelcolor="#ddd")
         ax.tick_params(colors="#aaa")
         ax.set_ylabel("Base 100" if normalize else "MAD", color="#aaa")
