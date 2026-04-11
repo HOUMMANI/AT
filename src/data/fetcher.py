@@ -1,9 +1,11 @@
 """
 Module de récupération des données de marché pour la BVC.
 Sources (par ordre de priorité) :
-  1. tvdatafeed   — TradingView unofficial API, exchange CSE, pas de rate-limit
-  2. leboursier.ma — Scraping du site marocain, données BVC directes
-  3. Yahoo Finance  — Fallback API directe + yfinance
+  1. Cache CSV     — données pré-calculées (GitHub Actions)
+  2. tvdatafeed    — TradingView unofficial API, exchange CSE, pas de rate-limit
+  3. idbourse.ma   — UDF TradingView endpoint (données BVC directes)
+  4. leboursier.ma — Scraping du site marocain, données BVC directes
+  5. Yahoo Finance  — Fallback API directe + yfinance
 """
 
 import pandas as pd
@@ -93,7 +95,78 @@ def _fetch_tvdatafeed(symbol: str, period: str = "1y", interval: str = "1d") -> 
         return pd.DataFrame()
 
 
-# ─── Source 2 : leboursier.ma ─────────────────────────────────────────────────
+# ─── Source 2 : idbourse.ma (TradingView UDF) ────────────────────────────────
+
+def _fetch_idbourse(symbol: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+    """
+    Récupère les données depuis idbourse.ma via son endpoint UDF TradingView.
+    idbourse.ma utilise TradingView Charting Library avec un datafeed UDF maison
+    pointant sur les données CSE (Casablanca Stock Exchange).
+
+    Protocol UDF : https://github.com/tradingview/charting_library/wiki/UDF
+    Endpoint     : https://idbourse.com/api/udf/history
+    Params       : symbol, resolution (1D/1W/1M), from (unix ts), to (unix ts)
+    """
+    try:
+        resolution_map = {
+            "1d": "1D",
+            "1wk": "1W",
+            "1mo": "1M",
+        }
+        resolution = resolution_map.get(interval, "1D")
+
+        days = _PERIOD_DAYS.get(period, 365)
+        now_ts = int(time.time())
+        from_ts = now_ts - (days or 365) * 86400
+
+        url = "https://idbourse.com/api/udf/history"
+        params = {
+            "symbol": symbol.upper(),
+            "resolution": resolution,
+            "from": from_ts,
+            "to": now_ts,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+            "Referer": "https://idbourse.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
+
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return pd.DataFrame()
+
+        data = resp.json()
+
+        # UDF répond avec {"s":"ok", "t":[...], "o":[...], "h":[...], "l":[...], "c":[...], "v":[...]}
+        if data.get("s") != "ok":
+            return pd.DataFrame()
+
+        timestamps = data.get("t", [])
+        if not timestamps:
+            return pd.DataFrame()
+
+        df = pd.DataFrame({
+            "Open":   data.get("o", [None] * len(timestamps)),
+            "High":   data.get("h", [None] * len(timestamps)),
+            "Low":    data.get("l", [None] * len(timestamps)),
+            "Close":  data.get("c", [None] * len(timestamps)),
+            "Volume": data.get("v", [0] * len(timestamps)),
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True))
+
+        df.index = df.index.tz_localize(None)
+        df.index.name = "Date"
+        df = df.sort_index()
+        df = df.apply(pd.to_numeric, errors="coerce")
+
+        return df.dropna(subset=["Close"]) if not df.empty else pd.DataFrame()
+
+    except Exception as e:
+        logger.debug(f"idbourse.ma échec pour {symbol}: {e}")
+        return pd.DataFrame()
+
+
+# ─── Source 3 : leboursier.ma ─────────────────────────────────────────────────
 
 def _fetch_leboursier(symbol: str, period: str = "1y") -> pd.DataFrame:
     """
@@ -194,7 +267,7 @@ def _fetch_leboursier(symbol: str, period: str = "1y") -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ─── Source 3 : Yahoo Finance API directe ────────────────────────────────────
+# ─── Source 4 : Yahoo Finance API directe ────────────────────────────────────
 
 def _fetch_yahoo_direct(yahoo_ticker: str, period: str = "1y",
                         start: Optional[str] = None, end: Optional[str] = None,
@@ -325,20 +398,26 @@ class BVCDataFetcher:
             if not df.empty:
                 logger.info(f"{symbol}: données depuis TradingView/CSE")
 
-        # 3. leboursier.ma
+        # 3. idbourse.ma (TradingView UDF)
+        if df.empty:
+            df = _fetch_idbourse(symbol, period=period, interval=interval)
+            if not df.empty:
+                logger.info(f"{symbol}: données depuis idbourse.ma (UDF)")
+
+        # 4. leboursier.ma
         if df.empty:
             df = _fetch_leboursier(symbol, period=period)
             if not df.empty:
                 logger.info(f"{symbol}: données depuis leboursier.ma")
 
-        # 4. Yahoo Finance API directe
+        # 5. Yahoo Finance API directe
         if df.empty:
             df = _fetch_yahoo_direct(yahoo_ticker, period=period,
                                       start=start, end=end, interval=interval)
             if not df.empty:
                 logger.info(f"{symbol}: données depuis Yahoo direct")
 
-        # 5. yfinance fallback
+        # 6. yfinance fallback
         if df.empty:
             try:
                 import yfinance as yf
